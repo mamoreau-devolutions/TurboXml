@@ -30,17 +30,22 @@ internal ref struct XmlParserInternal
     private int _contentLine;
     private int _contentColumn;
     private bool _xmlParsingBody;
+    private bool _isInProlog;
+    private bool _hasDocumentTypeDeclaration;
+    private readonly bool _ignoreDtd;
 
     private char[] _buffer;
     private int _length;
     private int _lastNameStackIndex;
 
-    public XmlParserInternal(ref THandler handler, ref TCharProvider stream)
+    public XmlParserInternal(ref THandler handler, ref TCharProvider stream, XmlParserOptions options)
     {
         _handler = ref handler;
         _stream = ref stream;
         _buffer = ArrayPool<char>.Shared.Rent(128);
         _column = -1;
+        _isInProlog = true;
+        _ignoreDtd = options.IgnoreDtd;
     }
 
     public void Dispose()
@@ -114,17 +119,24 @@ internal ref struct XmlParserInternal
                         }
                         else if (c == '[')
                         {
+                            _isInProlog = false;
                             ParseCData();
+                        }
+                        else if (c == 'D' && _ignoreDtd)
+                        {
+                            ParseDocumentTypeDeclaration();
                         }
                         else
                             ParseUnsupportedXmlDirective();
                     }
                     else if (c == '/')
                     {
+                        _isInProlog = false;
                         ParseEndTag();
                     }
                     else
                     {
+                        _isInProlog = false;
                         ParseBeginTag(c);
                     }
 
@@ -136,6 +148,7 @@ internal ref struct XmlParserInternal
                     break;
                 case '&':
                     _xmlParsingBody = true;
+                    _isInProlog = false;
                     ParseEntity(ref c);
                     break;
 
@@ -171,6 +184,10 @@ internal ref struct XmlParserInternal
 
                 default:
                     _xmlParsingBody = true;
+                    if (!XmlChar.IsWhiteSpace(c))
+                    {
+                        _isInProlog = false;
+                    }
 
                     if (XmlChar.IsChar(c))
                     {
@@ -686,6 +703,351 @@ internal ref struct XmlParserInternal
     private void ParseUnsupportedXmlDirective()
         => ThrowInvalidXml(XmlThrow.UnsupportedXmlDirective);
 
+    private void ParseDocumentTypeDeclaration()
+    {
+        if (!_isInProlog || _hasDocumentTypeDeclaration)
+            ThrowInvalidXml(XmlThrow.InvalidDocumentTypeDeclaration);
+
+        _hasDocumentTypeDeclaration = true;
+
+        var c = 'D';
+        foreach (var expected in "OCTYPE")
+        {
+            c = ReadNext();
+            if (c != expected)
+                ThrowInvalidXml(XmlThrow.InvalidDocumentTypeDeclaration);
+        }
+
+        c = ReadNext();
+        ExpectSpaces(ref c);
+        if (!TryParseName(ref c))
+            ThrowInvalidXml(XmlThrow.InvalidDocumentTypeDeclaration);
+
+        ClearCharacterBuffer();
+        SkipSpaces(ref c);
+
+        if (c == '>')
+            return;
+
+        if (c == '[')
+        {
+            ParseDtdInternalSubset();
+            return;
+        }
+
+        ParseDtdExternalId(ref c);
+        SkipSpaces(ref c);
+
+        if (c == '>')
+            return;
+
+        if (c == '[')
+        {
+            ParseDtdInternalSubset();
+            return;
+        }
+
+        ThrowInvalidXml(XmlThrow.InvalidDocumentTypeDeclaration);
+    }
+
+    private void ParseDtdExternalId(ref char c)
+    {
+        if (c == 'S')
+        {
+            ExpectDtdKeyword("SYSTEM", ref c);
+            ExpectSpaces(ref c);
+            ParseDtdLiteral(ref c, false);
+            return;
+        }
+
+        if (c == 'P')
+        {
+            ExpectDtdKeyword("PUBLIC", ref c);
+            ExpectSpaces(ref c);
+            ParseDtdLiteral(ref c, true);
+            ExpectSpaces(ref c);
+            ParseDtdLiteral(ref c, false);
+            return;
+        }
+
+        ThrowInvalidXml(XmlThrow.InvalidDocumentTypeDeclaration);
+    }
+
+    private void ExpectDtdKeyword(string keyword, ref char c)
+    {
+        foreach (var expected in keyword)
+        {
+            if (c != expected)
+                ThrowInvalidXml(XmlThrow.InvalidDocumentTypeDeclaration);
+
+            c = ReadNext();
+        }
+    }
+
+    private void ParseDtdLiteral(ref char c, bool isPublicIdentifier)
+    {
+        if (c != '"' && c != '\'')
+            ThrowInvalidXml(XmlThrow.InvalidDocumentTypeDeclaration);
+
+        var delimiter = c;
+        while (true)
+        {
+            c = ReadNext();
+
+        ProcessCharacter:
+            if (c == delimiter)
+            {
+                c = ReadNext();
+                return;
+            }
+
+            switch (c)
+            {
+                case '\n':
+                    _line++;
+                    _column = -1;
+                    break;
+                case '\r':
+                    c = ReadNext();
+                    _line++;
+                    if (c == '\n')
+                    {
+                        _column = -1;
+                    }
+                    else
+                    {
+                        _column = 0;
+                        goto ProcessCharacter;
+                    }
+
+                    break;
+                default:
+                    if (XmlChar.IsChar(c) && (!isPublicIdentifier || IsPublicIdentifierChar(c)))
+                    {
+                        break;
+                    }
+
+                    if (char.IsHighSurrogate(c))
+                    {
+                        ReadLowSurrogate();
+                        break;
+                    }
+
+                    ThrowInvalidXml(XmlThrow.InvalidDocumentTypeDeclaration);
+                    break;
+            }
+        }
+    }
+
+    private void ParseDtdInternalSubset()
+    {
+        var c = ReadNext();
+        while (true)
+        {
+        ProcessCharacter:
+            switch (c)
+            {
+                case ']':
+                    c = ReadNext();
+                    SkipSpaces(ref c);
+                    if (c != '>')
+                        ThrowInvalidXml(XmlThrow.InvalidDocumentTypeDeclaration);
+
+                    return;
+                case '\'':
+                case '"':
+                    ParseDtdLiteral(ref c, false);
+                    goto ProcessCharacter;
+                case '<':
+                    c = ReadNext();
+                    if (c == '!')
+                    {
+                        c = ReadNext();
+                        if (c == '-')
+                        {
+                            ParseDtdComment();
+                        }
+                        else
+                        {
+                            ParseDtdMarkupDeclaration(ref c);
+                        }
+                    }
+                    else if (c == '?')
+                    {
+                        ParseDtdProcessingInstruction();
+                    }
+                    else
+                    {
+                        ThrowInvalidXml(XmlThrow.InvalidDocumentTypeDeclaration);
+                    }
+
+                    break;
+                case '\n':
+                    _line++;
+                    _column = -1;
+                    break;
+                case '\r':
+                    c = ReadNext();
+                    _line++;
+                    if (c == '\n')
+                    {
+                        _column = -1;
+                    }
+                    else
+                    {
+                        _column = 0;
+                        goto ProcessCharacter;
+                    }
+
+                    break;
+                default:
+                    if (XmlChar.IsChar(c))
+                    {
+                        break;
+                    }
+
+                    if (char.IsHighSurrogate(c))
+                    {
+                        ReadLowSurrogate();
+                        break;
+                    }
+
+                    ThrowInvalidXml(XmlThrow.InvalidDocumentTypeDeclaration);
+                    break;
+            }
+
+            c = ReadNext();
+        }
+    }
+
+    private void ParseDtdMarkupDeclaration(ref char c)
+    {
+        while (true)
+        {
+        ProcessCharacter:
+            switch (c)
+            {
+                case '>':
+                    return;
+                case '\'':
+                case '"':
+                    ParseDtdLiteral(ref c, false);
+                    goto ProcessCharacter;
+                case '\n':
+                    _line++;
+                    _column = -1;
+                    break;
+                case '\r':
+                    c = ReadNext();
+                    _line++;
+                    if (c == '\n')
+                    {
+                        _column = -1;
+                    }
+                    else
+                    {
+                        _column = 0;
+                        goto ProcessCharacter;
+                    }
+
+                    break;
+                default:
+                    if (XmlChar.IsChar(c))
+                    {
+                        break;
+                    }
+
+                    if (char.IsHighSurrogate(c))
+                    {
+                        ReadLowSurrogate();
+                        break;
+                    }
+
+                    ThrowInvalidXml(XmlThrow.InvalidDocumentTypeDeclaration);
+                    break;
+            }
+
+            c = ReadNext();
+        }
+    }
+
+    private void ParseDtdComment()
+    {
+        if (ReadNext() != '-')
+            ThrowInvalidXml(XmlThrow.InvalidDocumentTypeDeclaration);
+
+        while (true)
+        {
+            var c = ReadNext();
+
+        ProcessCharacter:
+            switch (c)
+            {
+                case '-':
+                    c = ReadNext();
+                    if (c == '-')
+                    {
+                        if (ReadNext() != '>')
+                            ThrowInvalidXml(XmlThrow.InvalidDocumentTypeDeclaration);
+
+                        return;
+                    }
+
+                    goto ProcessCharacter;
+                case '\n':
+                    _line++;
+                    _column = -1;
+                    break;
+                case '\r':
+                    c = ReadNext();
+                    _line++;
+                    if (c == '\n')
+                    {
+                        _column = -1;
+                    }
+                    else
+                    {
+                        _column = 0;
+                        goto ProcessCharacter;
+                    }
+
+                    break;
+                default:
+                    if (XmlChar.IsCommentChar(c))
+                    {
+                        break;
+                    }
+
+                    if (char.IsHighSurrogate(c))
+                    {
+                        ReadLowSurrogate();
+                        break;
+                    }
+
+                    ThrowInvalidXml(XmlThrow.InvalidDocumentTypeDeclaration);
+                    break;
+            }
+        }
+    }
+
+    private void ParseDtdProcessingInstruction()
+    {
+        var c = ReadNext();
+        var targetStart = _length;
+        if (!TryParseName(ref c))
+            ThrowInvalidXml(XmlThrow.InvalidProcessingInstructionExpectingXml);
+
+        var targetLength = _length - targetStart;
+        ValidateProcessingInstructionTarget(GetTextSpan(targetStart).Slice(0, targetLength));
+        ParseProcessingInstruction(targetStart, targetLength, 0, 0, ref c, false);
+    }
+
+    private static bool IsPublicIdentifierChar(char c)
+    {
+        return char.IsAsciiLetterOrDigit(c)
+            || c is ' ' or '\r' or '\n' or '-' or '\'' or '(' or ')' or '+' or ',' or '.' or '/' or ':' or '=' or '?' or ';' or '!' or '*' or '#' or '@' or '$' or '_' or '%';
+    }
+
     private void ParseCData()
     {
         char c;
@@ -894,10 +1256,12 @@ internal ref struct XmlParserInternal
 
         char c = ReadNext();
 
+        var targetStart = _length;
         if (!TryParseName(ref c))
             ThrowInvalidXml(XmlThrow.InvalidProcessingInstructionExpectingXml);
 
-        var target = GetTextSpan();
+        var targetLength = _length - targetStart;
+        var target = GetTextSpan(targetStart).Slice(0, targetLength);
         if (target.SequenceEqual("xml".AsSpan()))
         {
             if (_xmlParsingBody)
@@ -908,6 +1272,12 @@ internal ref struct XmlParserInternal
             return;
         }
 
+        ValidateProcessingInstructionTarget(target);
+        ParseProcessingInstruction(targetStart, targetLength, startLine, startColumn, ref c, true);
+    }
+
+    private void ValidateProcessingInstructionTarget(ReadOnlySpan<char> target)
+    {
         if (target.Length == 3
             && (target[0] == 'x' || target[0] == 'X')
             && (target[1] == 'm' || target[1] == 'M')
@@ -915,13 +1285,32 @@ internal ref struct XmlParserInternal
         {
             ThrowInvalidXml(XmlThrow.InvalidProcessingInstructionExpectingXml);
         }
-
-        ClearCharacterBuffer();
-        ParseProcessingInstruction(ref c);
     }
 
-    private void ParseProcessingInstruction(ref char c)
+    private void ParseProcessingInstruction(int targetStart, int targetLength, int startLine, int startColumn, ref char c, bool report)
     {
+        var dataStart = _length;
+        var hasDataSeparator = XmlChar.IsWhiteSpace(c);
+        if (c == '?')
+        {
+            c = ReadNext();
+            if (c == '>')
+            {
+                if (report)
+                {
+                    _handler.OnProcessingInstruction(GetTextSpan(targetStart).Slice(0, targetLength), ReadOnlySpan<char>.Empty, startLine, startColumn);
+                }
+
+                ClearCharacterBuffer();
+                return;
+            }
+
+            if (report)
+            {
+                AppendCharacter('?');
+            }
+        }
+
         while (true)
         {
         ProcessNextChar:
@@ -931,14 +1320,32 @@ internal ref struct XmlParserInternal
                     c = ReadNext();
                     if (c == '>')
                     {
+                        if (!hasDataSeparator)
+                            ThrowInvalidXml(XmlThrow.InvalidProcessingInstructionExpectingWhitespaceOrQuestionGreaterThan);
+
+                        if (report)
+                        {
+                            _handler.OnProcessingInstruction(GetTextSpan(targetStart).Slice(0, targetLength), GetTextSpan(dataStart), startLine, startColumn);
+                        }
+
                         ClearCharacterBuffer();
                         return;
+                    }
+
+                    if (report)
+                    {
+                        AppendCharacter('?');
                     }
 
                     goto ProcessNextChar;
                 case '\n':
                     _line++;
                     _column = -1;
+                    if (report)
+                    {
+                        AppendCharacter(c);
+                    }
+
                     break;
                 case '\r':
                     if (!TryReadNext(out c))
@@ -948,10 +1355,20 @@ internal ref struct XmlParserInternal
                     if (c == '\n')
                     {
                         _column = -1;
+                        if (report)
+                        {
+                            AppendCharacter('\r');
+                            AppendCharacter(c);
+                        }
                     }
                     else
                     {
                         _column = 0;
+                        if (report)
+                        {
+                            AppendCharacter('\r');
+                        }
+
                         goto ProcessNextChar;
                     }
 
@@ -959,12 +1376,26 @@ internal ref struct XmlParserInternal
                 default:
                     if (XmlChar.IsChar(c))
                     {
+                        if (report)
+                        {
+                            AppendCharacter(c);
+                        }
+
                         break;
                     }
 
                     if (char.IsHighSurrogate(c))
                     {
-                        ReadLowSurrogate();
+                        if (report)
+                        {
+                            AppendCharacter(c);
+                            AppendCharacter(ReadLowSurrogate());
+                        }
+                        else
+                        {
+                            ReadLowSurrogate();
+                        }
+
                         break;
                     }
 
