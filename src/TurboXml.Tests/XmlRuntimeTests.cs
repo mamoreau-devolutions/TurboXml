@@ -78,6 +78,152 @@ public class XmlRuntimeTests
     }
 
     [TestMethod]
+    public void TestProcessingInstructionDataCanReconstructSource()
+    {
+        const string xml = "<?custom \tdata?\r\nhere?>";
+        var handler = new ProcessingInstructionHandler();
+
+        XmlParser.Parse(xml, handler);
+
+        Assert.HasCount(1, handler.Instructions);
+        var instruction = handler.Instructions[0];
+        Assert.AreEqual("custom", instruction.Target);
+        Assert.AreEqual(" \tdata?\r\nhere", instruction.Data);
+        Assert.AreEqual(xml, $"<?{instruction.Target}{instruction.Data}?>");
+        Assert.AreEqual(0, instruction.Line);
+        Assert.AreEqual(1, instruction.Column);
+    }
+
+    [TestMethod]
+    public void TestProcessingInstructionWithoutDataIsReported()
+    {
+        var handler = new ProcessingInstructionHandler();
+
+        XmlParser.Parse("<?before?>", handler);
+
+        Assert.HasCount(1, handler.Instructions);
+        Assert.AreEqual("before", handler.Instructions[0].Target);
+        Assert.AreEqual(string.Empty, handler.Instructions[0].Data);
+    }
+
+    [TestMethod]
+    public void TestProcessingInstructionInsideElementIsReported()
+    {
+        var handler = new ProcessingInstructionHandler();
+
+        XmlParser.Parse("""<root><?custom keep="data"?><child /></root>""", handler);
+
+        CollectionAssert.AreEqual(new[] { "root", "child" }, handler.BeginTags);
+        Assert.HasCount(1, handler.Instructions);
+        Assert.AreEqual("custom", handler.Instructions[0].Target);
+        Assert.AreEqual(" keep=\"data\"", handler.Instructions[0].Data);
+    }
+
+    [TestMethod]
+    public void TestMalformedProcessingInstructionIsRejected()
+    {
+        var result = ParseEvents("<root><?custom!?></root>");
+        var expecting = """
+                        BeginTag(root)
+                        Error(Invalid processing instruction. Expecting whitespace or ?> after the target)
+                        """;
+
+        Assert.AreEqual(NormalizeNewLines(expecting), result);
+    }
+
+    [TestMethod]
+    public void TestXmlDeclarationDoesNotReportProcessingInstruction()
+    {
+        var handler = new ProcessingInstructionHandler();
+
+        XmlParser.Parse("""<?xml version="1.0"?><root/>""", handler);
+
+        Assert.AreEqual(1, handler.XmlDeclarationCount);
+        Assert.IsEmpty(handler.Instructions);
+    }
+
+    [TestMethod]
+    public void TestDocumentTypeDeclarationIsRejectedByDefault()
+    {
+        var result = ParseEvents("""<!DOCTYPE root SYSTEM "file:///does-not-exist.dtd"><root/>""");
+
+        Assert.AreEqual("Error(Unsupported XML directive starting with !)", result);
+    }
+
+    [TestMethod]
+    public void TestDocumentTypeDeclarationCanBeIgnoredFromStringsAndStreams()
+    {
+        var options = new XmlParserOptions { IgnoreDtd = true };
+        var documentTypeDeclarations = new[]
+        {
+            "<!DOCTYPE root>",
+            """<!DOCTYPE root SYSTEM "file:///does-not-exist.dtd">""",
+            """<!DOCTYPE root PUBLIC "-//Example//DTD Root 1.0//EN" "file:///does-not-exist.dtd">""",
+            """<!DOCTYPE root [<!ELEMENT root (#PCDATA)><!ENTITY ignored "]>"><!-- ] --><?dtd-pi data?>]>""",
+        };
+        var expected = NormalizeNewLines(
+            """
+            BeginTag(root)
+            EndTagEmpty
+            """);
+
+        foreach (var documentTypeDeclaration in documentTypeDeclarations)
+        {
+            var xml = $"{documentTypeDeclaration}<root/>";
+            Assert.AreEqual(expected, ParseEvents(xml, options), documentTypeDeclaration);
+            Assert.AreEqual(expected, ParseStreamEvents(xml, options), documentTypeDeclaration);
+        }
+    }
+
+    [TestMethod]
+    public void TestProcessingInstructionInsideIgnoredDocumentTypeIsNotReported()
+    {
+        var handler = new ProcessingInstructionHandler();
+        const string xml = "<!DOCTYPE root [<?dtd-pi ignored?>]><?document-pi reported?><root/>";
+
+        XmlParser.Parse(xml, handler, new XmlParserOptions { IgnoreDtd = true });
+
+        Assert.HasCount(1, handler.Instructions);
+        Assert.AreEqual("document-pi", handler.Instructions[0].Target);
+        Assert.AreEqual(" reported", handler.Instructions[0].Data);
+    }
+
+    [TestMethod]
+    public void TestIgnoredDocumentTypeDoesNotDeclareEntities()
+    {
+        var result = ParseEvents(
+            """<!DOCTYPE root [<!ENTITY value "expanded">]><root>&value;</root>""",
+            new XmlParserOptions { IgnoreDtd = true });
+
+        Assert.AreEqual(
+            NormalizeNewLines(
+                """
+                BeginTag(root)
+                Error(Invalid entity name. Only &lt; or &gt; or &amp; or &apos; or &quot; are supported)
+                """),
+            result);
+    }
+
+    [TestMethod]
+    public void TestMalformedDocumentTypeDeclarationsAreRejectedWhenIgnored()
+    {
+        var options = new XmlParserOptions { IgnoreDtd = true };
+        var documents = new[]
+        {
+            "<!DOCTYPEroot><root/>",
+            "<!DOCTYPE root SYSTEM><root/>",
+            "<!DOCTYPE root [<!ELEMENT root ANY><root/>",
+            "<root/><!DOCTYPE root>",
+        };
+
+        foreach (var document in documents)
+        {
+            var result = ParseEvents(document, options);
+            Assert.IsTrue(result.Contains("Error(", StringComparison.Ordinal), result);
+        }
+    }
+
+    [TestMethod]
     public void TestXmlDeclarationMustRemainFirstAfterProcessingInstruction()
     {
         var xml = """<?xpacket begin="id"?><?xml version="1.0"?><root/>""";
@@ -342,10 +488,26 @@ public class XmlRuntimeTests
         return text.ReplaceLineEndings("\n").TrimEnd();
     }
 
-    private static string ParseEvents(string xml)
+    private static string ParseEvents(string xml, XmlParserOptions? options = null)
     {
         var handler = new XmlEventHandler { Writer = new StringWriter() };
-        XmlParser.Parse(xml, ref handler);
+        if (options.HasValue)
+        {
+            XmlParser.Parse(xml, ref handler, options.Value);
+        }
+        else
+        {
+            XmlParser.Parse(xml, ref handler);
+        }
+
+        return NormalizeNewLines(handler.Writer.ToString()!);
+    }
+
+    private static string ParseStreamEvents(string xml, XmlParserOptions options)
+    {
+        var handler = new XmlEventHandler { Writer = new StringWriter() };
+        using var stream = new MemoryStream(Encoding.UTF8.GetBytes(xml));
+        XmlParser.Parse(stream, ref handler, options);
         return NormalizeNewLines(handler.Writer.ToString()!);
     }
 
@@ -408,4 +570,24 @@ public class XmlRuntimeTests
         public void OnError(string message, int line, int column)
             => Writer.WriteLine($"Error({message})");
     }
+
+    private sealed class ProcessingInstructionHandler : IXmlReadHandler
+    {
+        public List<ProcessingInstruction> Instructions { get; } = [];
+
+        public List<string> BeginTags { get; } = [];
+
+        public int XmlDeclarationCount { get; private set; }
+
+        public void OnXmlDeclaration(ReadOnlySpan<char> version, ReadOnlySpan<char> encoding, ReadOnlySpan<char> standalone, int line, int column)
+            => XmlDeclarationCount++;
+
+        public void OnProcessingInstruction(ReadOnlySpan<char> target, ReadOnlySpan<char> data, int line, int column)
+            => Instructions.Add(new ProcessingInstruction(target.ToString(), data.ToString(), line, column));
+
+        public void OnBeginTag(ReadOnlySpan<char> name, int line, int column)
+            => BeginTags.Add(name.ToString());
+    }
+
+    private readonly record struct ProcessingInstruction(string Target, string Data, int Line, int Column);
 }
