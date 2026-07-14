@@ -750,7 +750,7 @@ public sealed class TurboXmlSerializerGenerator : IIncrementalGenerator
                 var member = model.Members[index];
                 if (member.Kind == MemberKind.Scalar)
                 {
-                    source.Append("                        case ").Append(index).Append(": ((").Append(FullyQualified(model.Symbol)).Append(")frame.Model).").Append(member.Symbol.Name).Append(" = ").Append(GetParseExpression(member.ScalarKind, member.ValueType)).AppendLine("; return;");
+                    source.Append("                        case ").Append(index).Append(": { ((").Append(FullyQualified(model.Symbol)).Append(")frame.Model).").Append(member.Symbol.Name).Append(" = ").Append(GetParseExpression(member.ScalarKind, member.ValueType)).AppendLine("; return; }");
                 }
             }
 
@@ -808,7 +808,7 @@ public sealed class TurboXmlSerializerGenerator : IIncrementalGenerator
                 var member = model.Members[index];
                 if (member.Kind == MemberKind.ScalarCollection)
                 {
-                    source.Append("                        case ").Append(index).Append(": ((global::System.Collections.Generic.List<").Append(FullyQualified(member.ValueType)).Append(">)frame.Collections![").Append(index).Append("]!).Add(").Append(GetParseExpression(member.ScalarKind, member.ValueType)).AppendLine("); return;");
+                    source.Append("                        case ").Append(index).Append(": { ((global::System.Collections.Generic.List<").Append(FullyQualified(member.ValueType)).Append(">)frame.Collections![").Append(index).Append("]!).Add(").Append(GetParseExpression(member.ScalarKind, member.ValueType)).AppendLine("); return; }");
                 }
             }
 

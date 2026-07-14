@@ -77,6 +77,9 @@ public sealed class TurboXmlSerializerTests
                              <Name>Compatibility</Name>
                              <Enabled>false</Enabled>
                              <Protocol>Rdp</Protocol>
+                             <AlternateProtocol>Telnet</AlternateProtocol>
+                             <Protocols><Protocol>Rdp</Protocol><Protocol>Ssh</Protocol></Protocols>
+                             <AlternateProtocols><AlternateProtocol>None</AlternateProtocol><AlternateProtocol>Telnet</AlternateProtocol></AlternateProtocols>
                              <Image>AQIDBA==</Image>
                              <ForwardCompatible key="value"><Child>text</Child></ForwardCompatible>
                            </Connection>
@@ -91,6 +94,13 @@ public sealed class TurboXmlSerializerTests
         Assert.AreEqual(framework.Name, generated.Name);
         Assert.AreEqual(framework.Enabled, generated.Enabled);
         Assert.AreEqual(framework.Protocol, generated.Protocol);
+        Assert.AreEqual(framework.AlternateProtocol, generated.AlternateProtocol);
+        Assert.IsNotNull(framework.Protocols);
+        Assert.IsNotNull(generated.Protocols);
+        CollectionAssert.AreEqual(framework.Protocols, generated.Protocols);
+        Assert.IsNotNull(framework.AlternateProtocols);
+        Assert.IsNotNull(generated.AlternateProtocols);
+        CollectionAssert.AreEqual(framework.AlternateProtocols, generated.AlternateProtocols);
         Assert.IsNotNull(framework.Image);
         Assert.IsNotNull(generated.Image);
         CollectionAssert.AreEqual(framework.Image, generated.Image);
@@ -206,6 +216,16 @@ public sealed class ConnectionFixture : ConnectionFixtureBase
 
     public ConnectionProtocol Protocol { get; set; }
 
+    public AlternateConnectionProtocol AlternateProtocol { get; set; }
+
+    [XmlArray("Protocols")]
+    [XmlArrayItem("Protocol")]
+    public List<ConnectionProtocol>? Protocols { get; set; }
+
+    [XmlArray("AlternateProtocols")]
+    [XmlArrayItem("AlternateProtocol")]
+    public List<AlternateConnectionProtocol>? AlternateProtocols { get; set; }
+
     public byte[]? Image { get; set; }
 
     [XmlAnyElement]
@@ -221,6 +241,12 @@ public enum ConnectionProtocol
 {
     Rdp,
     Ssh
+}
+
+public enum AlternateConnectionProtocol
+{
+    None,
+    Telnet
 }
 
 [TurboXmlSerializable(typeof(Connection))]
