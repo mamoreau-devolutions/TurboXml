@@ -77,6 +77,7 @@ public sealed class TurboXmlSerializerTests
                              <Name>Compatibility</Name>
                              <Enabled>false</Enabled>
                              <Protocol>Rdp</Protocol>
+                             <Image>AQIDBA==</Image>
                              <ForwardCompatible key="value"><Child>text</Child></ForwardCompatible>
                            </Connection>
                            """;
@@ -90,6 +91,9 @@ public sealed class TurboXmlSerializerTests
         Assert.AreEqual(framework.Name, generated.Name);
         Assert.AreEqual(framework.Enabled, generated.Enabled);
         Assert.AreEqual(framework.Protocol, generated.Protocol);
+        Assert.IsNotNull(framework.Image);
+        Assert.IsNotNull(generated.Image);
+        CollectionAssert.AreEqual(framework.Image, generated.Image);
         Assert.IsNotNull(framework.UnknownProperties);
         Assert.IsNotNull(generated.UnknownProperties);
         Assert.AreEqual(framework.UnknownProperties[0].OuterXml, generated.UnknownProperties[0].OuterXml);
@@ -201,6 +205,8 @@ public sealed class ConnectionFixture : ConnectionFixtureBase
     public bool Enabled { get; set; }
 
     public ConnectionProtocol Protocol { get; set; }
+
+    public byte[]? Image { get; set; }
 
     [XmlAnyElement]
     public XmlElement[]? UnknownProperties { get; set; }

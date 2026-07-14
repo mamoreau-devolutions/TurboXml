@@ -66,7 +66,8 @@ public enum ConnectionLoaderScenario
 {
     KnownSingle,
     ConnectionArray,
-    UnknownExtension
+    UnknownExtension,
+    BinaryPayload
 }
 
 public static class ConnectionLoaderFixture
@@ -78,6 +79,7 @@ public static class ConnectionLoaderFixture
             ConnectionLoaderScenario.KnownSingle => CreateConnection(1, includeUnknown: false),
             ConnectionLoaderScenario.ConnectionArray => "<Connections>" + CreateConnection(1, includeUnknown: false) + CreateConnection(2, includeUnknown: false) + CreateConnection(3, includeUnknown: false) + "</Connections>",
             ConnectionLoaderScenario.UnknownExtension => CreateConnection(1, includeUnknown: true),
+            ConnectionLoaderScenario.BinaryPayload => CreateConnection(1, includeUnknown: false, includeBinaryPayload: true),
             _ => throw new ArgumentOutOfRangeException(nameof(scenario))
         };
     }
@@ -121,6 +123,7 @@ public static class ConnectionLoaderFixture
                + connection.Host.Length
                + (int)connection.Protocol
                + (connection.Enabled ? 1 : 0)
+               + (connection.Image?.Length ?? 0)
                + (connection.UnknownProperties?.Length ?? 0);
     }
 
@@ -135,10 +138,13 @@ public static class ConnectionLoaderFixture
         return checksum;
     }
 
-    private static string CreateConnection(int id, bool includeUnknown)
+    private static string CreateConnection(int id, bool includeUnknown, bool includeBinaryPayload = false)
     {
         var extension = includeUnknown
             ? "<ForwardCompatible key=\"value\"><Child>text</Child><![CDATA[cdata]]><!--comment--></ForwardCompatible>"
+            : string.Empty;
+        var image = includeBinaryPayload
+            ? "<Image>VGhpcyBpcyBhIHJlYWxpc3RpYyBjb25uZWN0aW9uIGltYWdlIHBheWxvYWQu</Image>"
             : string.Empty;
         return $"""
                 <Connection id="{id}">
@@ -160,6 +166,7 @@ public static class ConnectionLoaderFixture
                   <Tags>production;windows</Tags>
                   <CreatedBy>benchmark</CreatedBy>
                   <UpdatedBy>benchmark</UpdatedBy>
+                  {image}
                   <Stamp><Ignored>legacy</Ignored></Stamp>
                   {extension}
                 </Connection>
@@ -221,6 +228,8 @@ public sealed class ConnectionBenchModel
     public string CreatedBy { get; set; } = string.Empty;
 
     public string UpdatedBy { get; set; } = string.Empty;
+
+    public byte[]? Image { get; set; }
 
     [XmlAnyElement]
     public XmlElement[]? UnknownProperties { get; set; }
@@ -337,6 +346,7 @@ internal static class CustomConnectionLoader
             case "Tags": result.Tags = reader.ReadElementContentAsString(); return true;
             case "CreatedBy": result.CreatedBy = reader.ReadElementContentAsString(); return true;
             case "UpdatedBy": result.UpdatedBy = reader.ReadElementContentAsString(); return true;
+            case "Image": result.Image = Convert.FromBase64String(reader.ReadElementContentAsString()); return true;
             default: return false;
         }
     }

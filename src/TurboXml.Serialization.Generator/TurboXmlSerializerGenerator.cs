@@ -959,6 +959,7 @@ public sealed class TurboXmlSerializerGenerator : IIncrementalGenerator
             ScalarKind.Guid => "global::System.Guid.Parse(value)",
             ScalarKind.DateTime => "global::System.Xml.XmlConvert.ToDateTime(value.ToString(), global::System.Xml.XmlDateTimeSerializationMode.RoundtripKind)",
             ScalarKind.DateTimeOffset => "global::System.Xml.XmlConvert.ToDateTimeOffset(value.ToString())",
+            ScalarKind.ByteArray => "global::System.Convert.FromBase64String(value.ToString())",
             ScalarKind.Enum => "global::System.Enum.TryParse<" + targetType + ">(value, false, out var parsed) ? parsed : throw new global::System.FormatException(\"Invalid enum value.\")",
             _ => throw new InvalidOperationException()
         };
@@ -971,6 +972,12 @@ public sealed class TurboXmlSerializerGenerator : IIncrementalGenerator
         if (nullable.TypeKind == TypeKind.Enum)
         {
             kind = ScalarKind.Enum;
+            return true;
+        }
+
+        if (nullable is IArrayTypeSymbol { ElementType.SpecialType: SpecialType.System_Byte })
+        {
+            kind = ScalarKind.ByteArray;
             return true;
         }
 
@@ -994,6 +1001,11 @@ public sealed class TurboXmlSerializerGenerator : IIncrementalGenerator
     {
         if (type is IArrayTypeSymbol array)
         {
+            if (array.ElementType.SpecialType == SpecialType.System_Byte)
+            {
+                return null;
+            }
+
             return new CollectionInfo(array.ElementType, CollectionAssignmentKind.Array);
         }
 
@@ -1229,6 +1241,7 @@ public sealed class TurboXmlSerializerGenerator : IIncrementalGenerator
         Guid,
         DateTime,
         DateTimeOffset,
+        ByteArray,
         Enum
     }
 }
