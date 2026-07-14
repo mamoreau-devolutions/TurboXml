@@ -92,9 +92,9 @@ var connection = TurboXmlSerializer.Deserialize(
     ConnectionContext.Default.ConnectionTypeInfo);
 ```
 
-The generated handler compares names as spans and assigns known scalar values directly. It can also deserialize root collections with `TurboXmlSerializer.DeserializeArray`. Configured skip names are ignored before unknown-element handling. `[XmlAnyElement]` creates `XmlDocument` nodes only after an unknown subtree is encountered, preserving the allocation-light fast path for known XML.
+The generated handler compares names as spans and assigns known values directly. It can also deserialize root collections with `TurboXmlSerializer.DeserializeArray`. Nested models use generated stack frames, so model graphs and self-referential models are read without reflection or `XmlSerializer`. Configured skip names are ignored before unknown-element handling. `[XmlAnyElement]` creates `XmlDocument` nodes only after an unknown subtree is encountered, preserving the allocation-light fast path for known XML.
 
-The current generated subset supports root models with scalar element and attribute values, enums, root arrays, `XmlAnyElement`, and named unknown-element skips. Unsupported nested or model-owned collection properties report a source-generator diagnostic rather than falling back to reflection.
+The generated subset supports scalar element and attribute values, enums, nested model properties, root arrays, `XmlAnyElement`, and named unknown-element skips. It recursively emits `TurboXmlTypeInfo` for every reachable model while safely handling cycles. Model-owned collections may be `T[]`, `List<T>`, or a supported generic list interface (`IEnumerable<T>`, `ICollection<T>`, `IList<T>`, `IReadOnlyCollection<T>`, or `IReadOnlyList<T>`), with scalar, enum, or model items. Use `[XmlArray]` and `[XmlArrayItem]` for wrapped collections; `[XmlElement]` supports flat repeated collection items. Unsupported shapes report a source-generator diagnostic rather than falling back to reflection.
 
 ## 📊 Benchmarks
 

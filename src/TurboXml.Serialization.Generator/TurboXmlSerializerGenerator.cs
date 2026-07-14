@@ -1,7 +1,6 @@
 using System;
 using System.Collections.Generic;
 using System.Collections.Immutable;
-using System.Globalization;
 using System.Linq;
 using System.Text;
 using Microsoft.CodeAnalysis;
@@ -77,24 +76,49 @@ public sealed class TurboXmlSerializerGenerator : IIncrementalGenerator
         }
 
         var skipElements = GetSkipElements(candidate.Symbol);
-        var models = new List<ModelInfo>();
+        var pendingModels = new Queue<INamedTypeSymbol>();
+        var discoveredModels = new HashSet<INamedTypeSymbol>(SymbolEqualityComparer.Default);
         foreach (var attribute in candidate.SerializableAttributes)
         {
-            if (attribute.ConstructorArguments.Length != 1 || attribute.ConstructorArguments[0].Value is not INamedTypeSymbol model)
+            if (attribute.ConstructorArguments.Length == 1
+                && attribute.ConstructorArguments[0].Value is INamedTypeSymbol model
+                && discoveredModels.Add(model))
             {
-                continue;
+                pendingModels.Enqueue(model);
+            }
+        }
+
+        var models = new List<ModelInfo>();
+        while (pendingModels.Count > 0)
+        {
+            var model = pendingModels.Dequeue();
+            var modelInfo = CreateModelInfo(context, model, skipElements);
+            if (modelInfo is null)
+            {
+                return;
             }
 
-            var modelInfo = CreateModelInfo(context, model, skipElements);
-            if (modelInfo is not null)
+            modelInfo.Index = models.Count;
+            models.Add(modelInfo);
+            foreach (var member in modelInfo.Members)
             {
-                models.Add(modelInfo);
+                if (member.ModelType is not null && discoveredModels.Add(member.ModelType))
+                {
+                    pendingModels.Enqueue(member.ModelType);
+                }
             }
         }
 
         if (models.Count == 0)
         {
             return;
+        }
+
+        AssignIdentifiers(models);
+        var modelIndexes = new Dictionary<INamedTypeSymbol, int>(SymbolEqualityComparer.Default);
+        foreach (var model in models)
+        {
+            modelIndexes.Add(model.Symbol, model.Index);
         }
 
         var source = new StringBuilder();
@@ -111,8 +135,9 @@ public sealed class TurboXmlSerializerGenerator : IIncrementalGenerator
         foreach (var model in models)
         {
             EmitTypeInfo(source, model);
-            EmitHandler(source, model);
         }
+
+        EmitHandler(source, models, modelIndexes);
         source.AppendLine("}");
 
         context.AddSource($"{candidate.Symbol.Name}.TurboXmlSerializer.g.cs", source.ToString());
@@ -149,7 +174,9 @@ public sealed class TurboXmlSerializerGenerator : IIncrementalGenerator
         INamedTypeSymbol model,
         Dictionary<INamedTypeSymbol, ImmutableArray<string>> skipElements)
     {
-        if (model.IsAbstract || model.Constructors.All(static constructor => constructor.Parameters.Length != 0 || constructor.DeclaredAccessibility != Accessibility.Public))
+        if (model.TypeKind != TypeKind.Class
+            || model.IsAbstract
+            || model.Constructors.All(static constructor => constructor.Parameters.Length != 0 || constructor.DeclaredAccessibility != Accessibility.Public))
         {
             context.ReportDiagnostic(Diagnostic.Create(UnsupportedProperty, model.Locations.FirstOrDefault(), model.Name, model.Name, "a public parameterless constructor is required"));
             return null;
@@ -184,33 +211,110 @@ public sealed class TurboXmlSerializerGenerator : IIncrementalGenerator
 
             var xmlAttribute = GetAttribute(property, "System.Xml.Serialization.XmlAttributeAttribute");
             var xmlElement = GetAttribute(property, "System.Xml.Serialization.XmlElementAttribute");
-            if (xmlAttribute is not null && xmlElement is not null)
+            var xmlArray = GetAttribute(property, "System.Xml.Serialization.XmlArrayAttribute");
+            var xmlArrayItem = GetAttribute(property, "System.Xml.Serialization.XmlArrayItemAttribute");
+            if (xmlAttribute is not null && (xmlElement is not null || xmlArray is not null))
             {
-                context.ReportDiagnostic(Diagnostic.Create(UnsupportedProperty, property.Locations.FirstOrDefault(), property.Name, model.Name, "a property cannot have both XmlAttribute and XmlElement"));
+                context.ReportDiagnostic(Diagnostic.Create(UnsupportedProperty, property.Locations.FirstOrDefault(), property.Name, model.Name, "a property cannot combine XmlAttribute with an XML element or array attribute"));
                 continue;
             }
 
-            if (HasAttribute(property, "System.Xml.Serialization.XmlArrayAttribute")
-                || property.Type is IArrayTypeSymbol
-                || IsList(property.Type))
+            var collection = GetCollectionInfo(property.Type);
+            if (collection is not null)
             {
-                context.ReportDiagnostic(Diagnostic.Create(UnsupportedProperty, property.Locations.FirstOrDefault(), property.Name, model.Name, "collections require a generated collection model and are not supported yet"));
+                if (xmlAttribute is not null)
+                {
+                    context.ReportDiagnostic(Diagnostic.Create(UnsupportedProperty, property.Locations.FirstOrDefault(), property.Name, model.Name, "collections cannot be XML attributes"));
+                    continue;
+                }
+
+                if (xmlArray is not null && xmlElement is not null)
+                {
+                    context.ReportDiagnostic(Diagnostic.Create(UnsupportedProperty, property.Locations.FirstOrDefault(), property.Name, model.Name, "a collection cannot combine XmlArray with XmlElement"));
+                    continue;
+                }
+
+                var collectionModelType = collection.ElementType as INamedTypeSymbol;
+                if (!TryGetScalarKind(collection.ElementType, out var collectionScalarKind)
+                    && collectionModelType is null)
+                {
+                    context.ReportDiagnostic(Diagnostic.Create(UnsupportedProperty, property.Locations.FirstOrDefault(), property.Name, model.Name, "collection elements must be supported scalars, enums, or model classes"));
+                    continue;
+                }
+
+                var collectionStyle = xmlElement is null ? CollectionStyle.Wrapped : CollectionStyle.Flat;
+                var elementName = collectionStyle == CollectionStyle.Wrapped
+                    ? xmlArray is null ? property.Name : GetXmlName(xmlArray, property.Name)
+                    : GetXmlName(xmlElement!, property.Name);
+                var itemElementName = collectionStyle == CollectionStyle.Wrapped
+                    ? xmlArrayItem is null ? GetDefaultElementName(collection.ElementType) : GetXmlName(xmlArrayItem, GetDefaultElementName(collection.ElementType))
+                    : elementName;
+                var kind = collectionScalarKind == ScalarKind.None ? MemberKind.ModelCollection : MemberKind.ScalarCollection;
+                members.Add(new MemberInfo(
+                    property,
+                    null,
+                    elementName,
+                    kind,
+                    collectionScalarKind,
+                    collection.ElementType,
+                    collectionScalarKind == ScalarKind.None ? collectionModelType : null,
+                    collectionStyle,
+                    itemElementName,
+                    collection.AssignmentKind));
                 continue;
             }
 
-            if (!TryGetScalarKind(property.Type, out var scalarKind))
+            if (xmlArray is not null || xmlArrayItem is not null)
             {
-                context.ReportDiagnostic(Diagnostic.Create(UnsupportedProperty, property.Locations.FirstOrDefault(), property.Name, model.Name, "nested object types are not supported yet"));
+                context.ReportDiagnostic(Diagnostic.Create(UnsupportedProperty, property.Locations.FirstOrDefault(), property.Name, model.Name, "XmlArray and XmlArrayItem require an array, List<T>, or a supported list interface"));
                 continue;
             }
 
-            var attributeName = xmlAttribute is null ? null : GetXmlName(xmlAttribute, property.Name);
-            var elementName = xmlAttribute is not null
-                ? null
-                : xmlElement is null
-                    ? property.Name
-                    : GetXmlName(xmlElement, property.Name);
-            members.Add(new MemberInfo(property, attributeName, elementName, scalarKind));
+            if (TryGetScalarKind(property.Type, out var scalarKind))
+            {
+                var attributeName = xmlAttribute is null ? null : GetXmlName(xmlAttribute, property.Name);
+                var elementName = xmlAttribute is not null
+                    ? null
+                    : xmlElement is null
+                        ? property.Name
+                        : GetXmlName(xmlElement, property.Name);
+                members.Add(new MemberInfo(
+                    property,
+                    attributeName,
+                    elementName,
+                    MemberKind.Scalar,
+                    scalarKind,
+                    property.Type,
+                    null,
+                    CollectionStyle.None,
+                    null,
+                    CollectionAssignmentKind.None));
+                continue;
+            }
+
+            if (xmlAttribute is not null)
+            {
+                context.ReportDiagnostic(Diagnostic.Create(UnsupportedProperty, property.Locations.FirstOrDefault(), property.Name, model.Name, "nested models cannot be XML attributes"));
+                continue;
+            }
+
+            if (property.Type is not INamedTypeSymbol nestedModelType)
+            {
+                context.ReportDiagnostic(Diagnostic.Create(UnsupportedProperty, property.Locations.FirstOrDefault(), property.Name, model.Name, "nested model types must be named classes"));
+                continue;
+            }
+
+            members.Add(new MemberInfo(
+                property,
+                null,
+                xmlElement is null ? property.Name : GetXmlName(xmlElement, property.Name),
+                MemberKind.Model,
+                ScalarKind.None,
+                property.Type,
+                nestedModelType,
+                CollectionStyle.None,
+                null,
+                CollectionAssignmentKind.None));
         }
 
         var rootAttribute = GetAttribute(model, "System.Xml.Serialization.XmlRootAttribute");
@@ -219,132 +323,161 @@ public sealed class TurboXmlSerializerGenerator : IIncrementalGenerator
         return new ModelInfo(model, rootName, members, unknownProperty, skips);
     }
 
+    private static void AssignIdentifiers(List<ModelInfo> models)
+    {
+        var identifiers = new Dictionary<string, int>(StringComparer.Ordinal);
+        foreach (var model in models)
+        {
+            var identifier = model.Symbol.Name + "TypeInfo";
+            if (identifiers.TryGetValue(identifier, out var count))
+            {
+                count++;
+                identifiers[identifier] = count;
+                model.Identifier = identifier + count;
+            }
+            else
+            {
+                identifiers.Add(identifier, 0);
+                model.Identifier = identifier;
+            }
+        }
+    }
+
     private static void EmitTypeInfo(StringBuilder source, ModelInfo model)
     {
         var typeName = FullyQualified(model.Symbol);
-        var identifier = GetIdentifier(model.Symbol);
-        source.Append("    public global::TurboXml.Serialization.TurboXmlTypeInfo<").Append(typeName).Append("> ").Append(identifier).AppendLine(" { get; } = new(");
-        source.Append("        Deserialize").Append(identifier).AppendLine(",");
-        source.Append("        Deserialize").Append(identifier).AppendLine("FromStream,");
-        source.Append("        Deserialize").Append(identifier).AppendLine("Array,");
-        source.Append("        Deserialize").Append(identifier).AppendLine("ArrayFromStream);");
+        source.Append("    public global::TurboXml.Serialization.TurboXmlTypeInfo<").Append(typeName).Append("> ").Append(model.Identifier).AppendLine(" { get; } = new(");
+        source.Append("        Deserialize").Append(model.Identifier).AppendLine(",");
+        source.Append("        Deserialize").Append(model.Identifier).AppendLine("FromStream,");
+        source.Append("        Deserialize").Append(model.Identifier).AppendLine("Array,");
+        source.Append("        Deserialize").Append(model.Identifier).AppendLine("ArrayFromStream);");
         source.AppendLine();
-        source.Append("    private static ").Append(typeName).Append(" Deserialize").Append(identifier).AppendLine("(string xml)");
+        source.Append("    private static ").Append(typeName).Append(" Deserialize").Append(model.Identifier).AppendLine("(string xml)");
         source.AppendLine("    {");
-        source.Append("        var handler = new ").Append(identifier).AppendLine("Handler();");
+        source.Append("        var handler = new TurboXmlGeneratedHandler(").Append(model.Index).AppendLine(", null);");
         source.AppendLine("        global::TurboXml.XmlParser.Parse(xml, ref handler);");
-        source.AppendLine("        return handler.GetResult();");
+        source.Append("        return (").Append(typeName).AppendLine(")handler.GetResult();");
         source.AppendLine("    }");
         source.AppendLine();
-        source.Append("    private static ").Append(typeName).Append(" Deserialize").Append(identifier).AppendLine("FromStream(global::System.IO.Stream stream)");
+        source.Append("    private static ").Append(typeName).Append(" Deserialize").Append(model.Identifier).AppendLine("FromStream(global::System.IO.Stream stream)");
         source.AppendLine("    {");
-        source.Append("        var handler = new ").Append(identifier).AppendLine("Handler();");
+        source.Append("        var handler = new TurboXmlGeneratedHandler(").Append(model.Index).AppendLine(", null);");
         source.AppendLine("        global::TurboXml.XmlParser.Parse(stream, ref handler);");
-        source.AppendLine("        return handler.GetResult();");
+        source.Append("        return (").Append(typeName).AppendLine(")handler.GetResult();");
         source.AppendLine("    }");
         source.AppendLine();
-        source.Append("    private static ").Append(typeName).Append("[] Deserialize").Append(identifier).AppendLine("Array(string xml, string itemElementName)");
+        source.Append("    private static ").Append(typeName).Append("[] Deserialize").Append(model.Identifier).AppendLine("Array(string xml, string itemElementName)");
         source.AppendLine("    {");
-        source.Append("        var handler = new ").Append(identifier).AppendLine("Handler(itemElementName);");
+        source.Append("        var handler = new TurboXmlGeneratedHandler(").Append(model.Index).AppendLine(", itemElementName);");
         source.AppendLine("        global::TurboXml.XmlParser.Parse(xml, ref handler);");
-        source.AppendLine("        return handler.GetArrayResult();");
+        source.Append("        return handler.GetArrayResult<").Append(typeName).AppendLine(">();");
         source.AppendLine("    }");
         source.AppendLine();
-        source.Append("    private static ").Append(typeName).Append("[] Deserialize").Append(identifier).AppendLine("ArrayFromStream(global::System.IO.Stream stream, string itemElementName)");
+        source.Append("    private static ").Append(typeName).Append("[] Deserialize").Append(model.Identifier).AppendLine("ArrayFromStream(global::System.IO.Stream stream, string itemElementName)");
         source.AppendLine("    {");
-        source.Append("        var handler = new ").Append(identifier).AppendLine("Handler(itemElementName);");
+        source.Append("        var handler = new TurboXmlGeneratedHandler(").Append(model.Index).AppendLine(", itemElementName);");
         source.AppendLine("        global::TurboXml.XmlParser.Parse(stream, ref handler);");
-        source.AppendLine("        return handler.GetArrayResult();");
+        source.Append("        return handler.GetArrayResult<").Append(typeName).AppendLine(">();");
         source.AppendLine("    }");
         source.AppendLine();
     }
 
-    private static void EmitHandler(StringBuilder source, ModelInfo model)
+    private static void EmitHandler(
+        StringBuilder source,
+        List<ModelInfo> models,
+        Dictionary<INamedTypeSymbol, int> modelIndexes)
     {
-        var typeName = FullyQualified(model.Symbol);
-        var identifier = GetIdentifier(model.Symbol);
-        source.Append("    private struct ").Append(identifier).AppendLine("Handler : global::TurboXml.IXmlReadHandler");
+        source.AppendLine("    private struct TurboXmlGeneratedHandler : global::TurboXml.IXmlReadHandler");
         source.AppendLine("    {");
-        source.Append("        private ").Append(typeName).AppendLine("? _result;");
-        source.Append("        private global::System.Collections.Generic.List<").Append(typeName).AppendLine(">? _results;");
-        source.AppendLine("        private readonly string? _itemElementName;");
-        source.AppendLine("        private int _depth;");
-        source.AppendLine("        private int _currentMember;");
-        source.AppendLine("        private int _skipDepth;");
-        source.AppendLine("        private global::System.Xml.XmlDocument? _unknownDocument;");
-        source.AppendLine("        private global::System.Collections.Generic.List<global::System.Xml.XmlElement>? _unknownStack;");
-        source.AppendLine("        private global::System.Collections.Generic.List<global::System.Xml.XmlElement>? _unknownElements;");
-        source.AppendLine();
-        source.Append("        public ").Append(identifier).AppendLine("Handler(string itemElementName)");
+        source.AppendLine("        private sealed class Frame");
         source.AppendLine("        {");
-        source.AppendLine("            _result = null;");
-        source.AppendLine("            _results = null;");
-        source.AppendLine("            _itemElementName = itemElementName;");
-        source.AppendLine("            _depth = 0;");
-        source.AppendLine("            _currentMember = -1;");
-        source.AppendLine("            _skipDepth = 0;");
-        source.AppendLine("            _unknownDocument = null;");
-        source.AppendLine("            _unknownStack = null;");
-        source.AppendLine("            _unknownElements = null;");
+        source.AppendLine("            public object Model = null!;");
+        source.AppendLine("            public int ModelIndex;");
+        source.AppendLine("            public int ElementDepth;");
+        source.AppendLine("            public Frame? Parent;");
+        source.AppendLine("            public int ParentMember;");
+        source.AppendLine("            public int CurrentMember = -1;");
+        source.AppendLine("            public int CurrentMemberDepth;");
+        source.AppendLine("            public bool CurrentMemberIsCollection;");
+        source.AppendLine("            public int CollectionMember = -1;");
+        source.AppendLine("            public int CollectionDepth;");
+        source.AppendLine("            public object?[]? Collections;");
+        source.AppendLine("            public global::System.Xml.XmlDocument? UnknownDocument;");
+        source.AppendLine("            public global::System.Collections.Generic.List<global::System.Xml.XmlElement>? UnknownStack;");
+        source.AppendLine("            public global::System.Collections.Generic.List<global::System.Xml.XmlElement>? UnknownElements;");
+        source.AppendLine("            public int SkipDepth;");
         source.AppendLine("        }");
         source.AppendLine();
-        source.Append("        public ").Append(identifier).AppendLine("Handler()");
-        source.AppendLine("            : this(null!)");
+        source.AppendLine("        private readonly int _rootModelIndex;");
+        source.AppendLine("        private readonly string? _itemElementName;");
+        source.AppendLine("        private int _depth;");
+        source.AppendLine("        private global::System.Collections.Generic.List<Frame>? _frames;");
+        source.AppendLine("        private object? _result;");
+        source.AppendLine("        private global::System.Collections.Generic.List<object>? _results;");
+        source.AppendLine();
+        source.AppendLine("        public TurboXmlGeneratedHandler(int rootModelIndex, string? itemElementName)");
         source.AppendLine("        {");
+        source.AppendLine("            _rootModelIndex = rootModelIndex;");
+        source.AppendLine("            _itemElementName = itemElementName;");
+        source.AppendLine("            _depth = 0;");
+        source.AppendLine("            _frames = null;");
+        source.AppendLine("            _result = null;");
+        source.AppendLine("            _results = null;");
         source.AppendLine("        }");
         source.AppendLine();
         source.AppendLine("        public void OnBeginTag(global::System.ReadOnlySpan<char> name, int line, int column)");
         source.AppendLine("        {");
         source.AppendLine("            _depth++;");
-        source.AppendLine("            if (IsCapturingUnknown())");
+        source.AppendLine("            if (_frames is { Count: > 0 })");
         source.AppendLine("            {");
-        source.AppendLine("                AddUnknownElement(name);");
-        source.AppendLine("                return;");
-        source.AppendLine("            }");
-        source.AppendLine("            if (_skipDepth != 0)");
-        source.AppendLine("            {");
+        source.AppendLine("                var frame = GetCurrentFrame();");
+        source.AppendLine("                if (IsCapturingUnknown(frame)) { AddUnknownElement(frame, name); return; }");
+        source.AppendLine("                if (frame.SkipDepth != 0) return;");
+        source.AppendLine("                if (_depth == frame.ElementDepth + 1) { DispatchDirectElement(frame, name); return; }");
+        source.AppendLine("                if (frame.CollectionDepth != 0 && _depth == frame.CollectionDepth + 1) { DispatchCollectionElement(frame, name); return; }");
         source.AppendLine("                return;");
         source.AppendLine("            }");
         source.AppendLine("            if (_depth == 1)");
         source.AppendLine("            {");
         source.AppendLine("                if (_itemElementName is null)");
         source.AppendLine("                {");
-        source.AppendLine("                    if (!name.SequenceEqual(" + Literal(model.RootName) + ".AsSpan())) throw new global::System.Xml.XmlException(\"Unexpected root element.\");");
-        source.AppendLine("                    StartResult();");
+        source.AppendLine("                    if (!IsRootName(_rootModelIndex, name)) throw new global::System.Xml.XmlException(\"Unexpected root element.\");");
+        source.AppendLine("                    StartModel(_rootModelIndex, null, -1);");
         source.AppendLine("                }");
         source.AppendLine("                return;");
         source.AppendLine("            }");
-        source.AppendLine("            if (_itemElementName is not null && _depth == 2)");
-        source.AppendLine("            {");
-        source.AppendLine("                if (!name.SequenceEqual(_itemElementName.AsSpan())) return;");
-        source.AppendLine("                StartResult();");
-        source.AppendLine("                return;");
-        source.AppendLine("            }");
-        source.AppendLine("            if (!HasCurrentResult() || _depth != ModelDepth() + 1) return;");
-        EmitKnownElementDispatch(source, model);
+        source.AppendLine("            if (_itemElementName is not null && _depth == 2 && name.SequenceEqual(_itemElementName.AsSpan())) StartModel(_rootModelIndex, null, -1);");
         source.AppendLine("        }");
         source.AppendLine();
         source.AppendLine("        public void OnAttribute(global::System.ReadOnlySpan<char> name, global::System.ReadOnlySpan<char> value, int nameLine, int nameColumn, int valueLine, int valueColumn)");
         source.AppendLine("        {");
-        source.AppendLine("            if (IsCapturingUnknown()) { AddUnknownAttribute(name, value); return; }");
-        source.AppendLine("            if (_skipDepth != 0 || !HasCurrentResult() || _depth != ModelDepth()) return;");
-        EmitAttributeDispatch(source, model);
+        source.AppendLine("            if (_frames is not { Count: > 0 }) return;");
+        source.AppendLine("            var frame = GetCurrentFrame();");
+        source.AppendLine("            if (IsCapturingUnknown(frame)) { AddUnknownAttribute(frame, name, value); return; }");
+        source.AppendLine("            if (frame.SkipDepth != 0 || _depth != frame.ElementDepth) return;");
+        source.AppendLine("            DispatchAttribute(frame, name, value);");
         source.AppendLine("        }");
         source.AppendLine();
         source.AppendLine("        public void OnText(global::System.ReadOnlySpan<char> text, int line, int column)");
         source.AppendLine("        {");
-        source.AppendLine("            if (IsCapturingUnknown()) { AddUnknownText(text); return; }");
-        source.AppendLine("            if (_skipDepth == 0 && _currentMember >= 0) SetMember(_currentMember, text);");
+        source.AppendLine("            if (_frames is not { Count: > 0 }) return;");
+        source.AppendLine("            var frame = GetCurrentFrame();");
+        source.AppendLine("            if (IsCapturingUnknown(frame)) { AddUnknownText(frame, text); return; }");
+        source.AppendLine("            if (frame.SkipDepth == 0 && frame.CurrentMember >= 0 && frame.CurrentMemberDepth == _depth)");
+        source.AppendLine("            {");
+        source.AppendLine("                if (frame.CurrentMemberIsCollection) AddScalarCollectionMember(frame, frame.CurrentMember, text);");
+        source.AppendLine("                else SetScalarMember(frame, frame.CurrentMember, text);");
+        source.AppendLine("            }");
         source.AppendLine("        }");
         source.AppendLine();
         source.AppendLine("        public void OnCData(global::System.ReadOnlySpan<char> cdata, int line, int column)");
         source.AppendLine("        {");
-        source.AppendLine("            if (IsCapturingUnknown()) AddUnknownCData(cdata);");
+        source.AppendLine("            if (_frames is { Count: > 0 } && IsCapturingUnknown(GetCurrentFrame())) AddUnknownCData(GetCurrentFrame(), cdata);");
         source.AppendLine("        }");
         source.AppendLine();
         source.AppendLine("        public void OnComment(global::System.ReadOnlySpan<char> comment, int line, int column)");
         source.AppendLine("        {");
-        source.AppendLine("            if (IsCapturingUnknown()) AddUnknownComment(comment);");
+        source.AppendLine("            if (_frames is { Count: > 0 } && IsCapturingUnknown(GetCurrentFrame())) AddUnknownComment(GetCurrentFrame(), comment);");
         source.AppendLine("        }");
         source.AppendLine();
         source.AppendLine("        public void OnXmlDeclaration(global::System.ReadOnlySpan<char> version, global::System.ReadOnlySpan<char> encoding, global::System.ReadOnlySpan<char> standalone, int line, int column) { }");
@@ -353,141 +486,469 @@ public sealed class TurboXmlSerializerGenerator : IIncrementalGenerator
         source.AppendLine("        public void OnEndTag(global::System.ReadOnlySpan<char> name, int line, int column) => EndElement();");
         source.AppendLine("        public void OnEndTagEmpty() => EndElement();");
         source.AppendLine();
-        source.AppendLine("        public " + typeName + " GetResult() => _result ?? throw new global::System.Xml.XmlException(\"No root element was found.\");");
-        source.AppendLine("        public " + typeName + "[] GetArrayResult() => _results?.ToArray() ?? [];");
-        source.AppendLine();
-        source.AppendLine("        private bool HasCurrentResult() => _result is not null;");
-        source.AppendLine("        private int ModelDepth() => _itemElementName is null ? 1 : 2;");
-        source.AppendLine("        private bool IsCapturingUnknown() => _unknownStack is not null;");
-        source.AppendLine();
-        source.AppendLine("        private void StartResult()");
+        source.AppendLine("        public object GetResult() => _result ?? throw new global::System.Xml.XmlException(\"No root element was found.\");");
+        source.AppendLine("        public T[] GetArrayResult<T>()");
         source.AppendLine("        {");
-        source.AppendLine("            _result = new " + typeName + "();");
-        source.AppendLine("            _currentMember = -1;");
-        source.AppendLine("            _skipDepth = 0;");
-        if (model.UnknownProperty is not null)
-        {
-            source.AppendLine("            _unknownElements = null;");
-        }
+        source.AppendLine("            if (_results is not { Count: > 0 }) return [];");
+        source.AppendLine("            var result = new T[_results.Count];");
+        source.AppendLine("            for (var index = 0; index < result.Length; index++) result[index] = (T)_results[index];");
+        source.AppendLine("            return result;");
         source.AppendLine("        }");
+        source.AppendLine();
+        source.AppendLine("        private Frame GetCurrentFrame() => _frames![_frames.Count - 1];");
+        source.AppendLine("        private static bool IsCapturingUnknown(Frame frame) => frame.UnknownStack is not null;");
         source.AppendLine();
         source.AppendLine("        private void EndElement()");
         source.AppendLine("        {");
-        source.AppendLine("            if (IsCapturingUnknown()) { EndUnknownElement(); _depth--; return; }");
-        source.AppendLine("            if (_skipDepth != 0) { if (_depth == _skipDepth) _skipDepth = 0; _depth--; return; }");
-        source.AppendLine("            if (_currentMember >= 0 && _depth == ModelDepth() + 1) _currentMember = -1;");
-        source.AppendLine("            if (HasCurrentResult() && _depth == ModelDepth()) FinishResult();");
+        source.AppendLine("            if (_frames is not { Count: > 0 }) { _depth--; return; }");
+        source.AppendLine("            var frame = GetCurrentFrame();");
+        source.AppendLine("            if (IsCapturingUnknown(frame)) { EndUnknownElement(frame); _depth--; return; }");
+        source.AppendLine("            if (frame.SkipDepth != 0) { if (_depth == frame.SkipDepth) frame.SkipDepth = 0; _depth--; return; }");
+        source.AppendLine("            if (frame.CurrentMemberDepth == _depth) { frame.CurrentMember = -1; frame.CurrentMemberDepth = 0; frame.CurrentMemberIsCollection = false; }");
+        source.AppendLine("            if (frame.CollectionDepth == _depth) { frame.CollectionMember = -1; frame.CollectionDepth = 0; }");
+        source.AppendLine("            if (_depth == frame.ElementDepth) FinishModel(frame);");
         source.AppendLine("            _depth--;");
         source.AppendLine("        }");
         source.AppendLine();
-        source.AppendLine("        private void FinishResult()");
+        source.AppendLine("        private void StartModel(int modelIndex, Frame? parent, int parentMember)");
         source.AppendLine("        {");
-        if (model.UnknownProperty is not null)
-        {
-            source.AppendLine("            if (_unknownElements is { Count: > 0 }) _result!." + model.UnknownProperty.Name + " = _unknownElements.ToArray();");
-        }
-        source.AppendLine("            if (_itemElementName is not null)");
+        source.AppendLine("            var frame = new Frame { ModelIndex = modelIndex, ElementDepth = _depth, Parent = parent, ParentMember = parentMember };");
+        source.AppendLine("            switch (modelIndex)");
         source.AppendLine("            {");
-        source.AppendLine("                (_results ??= new global::System.Collections.Generic.List<" + typeName + ">()).Add(_result!);");
-        source.AppendLine("                _result = null;");
+        foreach (var model in models)
+        {
+            source.Append("                case ").Append(model.Index).Append(": frame.Model = new ").Append(FullyQualified(model.Symbol)).AppendLine("(); break;");
+        }
+
+        source.AppendLine("                default: throw new global::System.InvalidOperationException(\"Unknown generated model.\");");
         source.AppendLine("            }");
+        source.AppendLine("            (_frames ??= new global::System.Collections.Generic.List<Frame>()).Add(frame);");
         source.AppendLine("        }");
         source.AppendLine();
-        EmitSetMember(source, model);
-        if (model.UnknownProperty is not null)
-        {
-            EmitUnknownCapture(source);
-        }
-        else
-        {
-            source.AppendLine("        private void CaptureUnknown(global::System.ReadOnlySpan<char> name) { }");
-        }
+        source.AppendLine("        private void FinishModel(Frame frame)");
+        source.AppendLine("        {");
+        source.AppendLine("            AssignCollections(frame);");
+        source.AppendLine("            AssignUnknownElements(frame);");
+        source.AppendLine("            var completed = frame.Model;");
+        source.AppendLine("            _frames!.RemoveAt(_frames.Count - 1);");
+        source.AppendLine("            if (frame.Parent is null)");
+        source.AppendLine("            {");
+        source.AppendLine("                if (_itemElementName is null) _result = completed;");
+        source.AppendLine("                else (_results ??= new global::System.Collections.Generic.List<object>()).Add(completed);");
+        source.AppendLine("                return;");
+        source.AppendLine("            }");
+        source.AppendLine("            AttachCompletedModel(frame.Parent, frame.ParentMember, completed);");
+        source.AppendLine("        }");
+        source.AppendLine();
+        EmitRootNameCheck(source, models);
+        EmitSkipCheck(source, models);
+        EmitDirectElementDispatch(source, models, modelIndexes);
+        EmitCollectionElementDispatch(source, models, modelIndexes);
+        EmitAttributeDispatch(source, models);
+        EmitScalarMemberSetter(source, models);
+        EmitCollectionSupport(source, models);
+        EmitCompletedModelAttachment(source, models, modelIndexes);
+        EmitUnknownCapture(source, models);
         source.AppendLine("    }");
         source.AppendLine();
     }
 
-    private static void EmitKnownElementDispatch(StringBuilder source, ModelInfo model)
+    private static void EmitRootNameCheck(StringBuilder source, List<ModelInfo> models)
     {
-        foreach (var skip in model.SkipElements)
-        {
-            source.Append("            if (name.SequenceEqual(").Append(Literal(skip)).AppendLine(".AsSpan())) { _skipDepth = _depth; return; }");
-        }
-        for (var index = 0; index < model.Members.Count; index++)
-        {
-            var member = model.Members[index];
-            if (member.ElementName is not null)
-            {
-                source.Append("            if (name.SequenceEqual(").Append(Literal(member.ElementName)).Append(".AsSpan())) { _currentMember = ").Append(index).AppendLine("; return; }");
-            }
-        }
-        source.AppendLine("            CaptureUnknown(name);");
-    }
-
-    private static void EmitAttributeDispatch(StringBuilder source, ModelInfo model)
-    {
-        for (var index = 0; index < model.Members.Count; index++)
-        {
-            var member = model.Members[index];
-            if (member.AttributeName is not null)
-            {
-                source.Append("            if (name.SequenceEqual(").Append(Literal(member.AttributeName)).Append(".AsSpan())) { SetMember(").Append(index).AppendLine(", value); return; }");
-            }
-        }
-    }
-
-    private static void EmitSetMember(StringBuilder source, ModelInfo model)
-    {
-        source.AppendLine("        private void SetMember(int member, global::System.ReadOnlySpan<char> value)");
+        source.AppendLine("        private static bool IsRootName(int modelIndex, global::System.ReadOnlySpan<char> name)");
         source.AppendLine("        {");
-        source.AppendLine("            switch (member)");
+        source.AppendLine("            switch (modelIndex)");
         source.AppendLine("            {");
-        for (var index = 0; index < model.Members.Count; index++)
+        foreach (var model in models)
         {
-            var member = model.Members[index];
-            source.Append("                case ").Append(index).Append(": _result!.").Append(member.Symbol.Name).Append(" = ").Append(GetParseExpression(member)).AppendLine("; return;");
+            source.Append("                case ").Append(model.Index).Append(": return name.SequenceEqual(").Append(Literal(model.RootName)).AppendLine(".AsSpan());");
         }
-        source.AppendLine("                default: throw new global::System.InvalidOperationException(\"Unknown generated member.\");");
+
+        source.AppendLine("                default: return false;");
         source.AppendLine("            }");
         source.AppendLine("        }");
         source.AppendLine();
     }
 
-    private static void EmitUnknownCapture(StringBuilder source)
+    private static void EmitSkipCheck(StringBuilder source, List<ModelInfo> models)
     {
-        source.AppendLine("        private void CaptureUnknown(global::System.ReadOnlySpan<char> name)");
+        source.AppendLine("        private bool TryStartSkip(Frame frame, global::System.ReadOnlySpan<char> name)");
         source.AppendLine("        {");
-        source.AppendLine("            _unknownDocument = new global::System.Xml.XmlDocument();");
-        source.AppendLine("            var element = _unknownDocument.CreateElement(name.ToString());");
-        source.AppendLine("            _unknownDocument.AppendChild(element);");
-        source.AppendLine("            _unknownStack = new global::System.Collections.Generic.List<global::System.Xml.XmlElement> { element };");
-        source.AppendLine("        }");
-        source.AppendLine("        private void AddUnknownElement(global::System.ReadOnlySpan<char> name)");
-        source.AppendLine("        {");
-        source.AppendLine("            var element = _unknownDocument!.CreateElement(name.ToString());");
-        source.AppendLine("            _unknownStack![_unknownStack.Count - 1].AppendChild(element);");
-        source.AppendLine("            _unknownStack.Add(element);");
-        source.AppendLine("        }");
-        source.AppendLine("        private void AddUnknownAttribute(global::System.ReadOnlySpan<char> name, global::System.ReadOnlySpan<char> value) => _unknownStack![_unknownStack.Count - 1].SetAttribute(name.ToString(), value.ToString());");
-        source.AppendLine("        private void AddUnknownText(global::System.ReadOnlySpan<char> value) => _unknownStack![_unknownStack.Count - 1].AppendChild(_unknownDocument!.CreateTextNode(value.ToString()));");
-        source.AppendLine("        private void AddUnknownCData(global::System.ReadOnlySpan<char> value) => _unknownStack![_unknownStack.Count - 1].AppendChild(_unknownDocument!.CreateCDataSection(value.ToString()));");
-        source.AppendLine("        private void AddUnknownComment(global::System.ReadOnlySpan<char> value) => _unknownStack![_unknownStack.Count - 1].AppendChild(_unknownDocument!.CreateComment(value.ToString()));");
-        source.AppendLine("        private void EndUnknownElement()");
-        source.AppendLine("        {");
-        source.AppendLine("            var index = _unknownStack!.Count - 1;");
-        source.AppendLine("            var element = _unknownStack[index];");
-        source.AppendLine("            _unknownStack.RemoveAt(index);");
-        source.AppendLine("            if (_unknownStack.Count != 0) return;");
-        source.AppendLine("            (_unknownElements ??= new global::System.Collections.Generic.List<global::System.Xml.XmlElement>()).Add(element);");
-        source.AppendLine("            _unknownDocument = null;");
-        source.AppendLine("            _unknownStack = null;");
+        source.AppendLine("            switch (frame.ModelIndex)");
+        source.AppendLine("            {");
+        foreach (var model in models)
+        {
+            source.Append("                case ").Append(model.Index).AppendLine(":");
+            foreach (var skip in model.SkipElements)
+            {
+                source.Append("                    if (name.SequenceEqual(").Append(Literal(skip)).AppendLine(".AsSpan())) { frame.SkipDepth = _depth; return true; }");
+            }
+
+            source.AppendLine("                    return false;");
+        }
+
+        source.AppendLine("                default: return false;");
+        source.AppendLine("            }");
         source.AppendLine("        }");
         source.AppendLine();
     }
 
-    private static string GetParseExpression(MemberInfo member)
+    private static void EmitDirectElementDispatch(
+        StringBuilder source,
+        List<ModelInfo> models,
+        Dictionary<INamedTypeSymbol, int> modelIndexes)
     {
-        var targetType = FullyQualified(GetNonNullableType(member.Symbol.Type));
-        return member.Kind switch
+        source.AppendLine("        private void DispatchDirectElement(Frame frame, global::System.ReadOnlySpan<char> name)");
+        source.AppendLine("        {");
+        source.AppendLine("            if (TryStartSkip(frame, name)) return;");
+        source.AppendLine("            switch (frame.ModelIndex)");
+        source.AppendLine("            {");
+        foreach (var model in models)
+        {
+            source.Append("                case ").Append(model.Index).AppendLine(":");
+            for (var index = 0; index < model.Members.Count; index++)
+            {
+                var member = model.Members[index];
+                if (member.ElementName is null)
+                {
+                    continue;
+                }
+
+                source.Append("                    if (name.SequenceEqual(").Append(Literal(member.ElementName)).AppendLine(".AsSpan()))");
+                source.AppendLine("                    {");
+                switch (member.Kind)
+                {
+                    case MemberKind.Scalar:
+                        source.Append("                        BeginScalarMember(frame, ").Append(index).AppendLine(", false);");
+                        break;
+                    case MemberKind.Model:
+                        source.Append("                        StartModel(").Append(modelIndexes[member.ModelType!]).Append(", frame, ").Append(index).AppendLine(");");
+                        break;
+                    case MemberKind.ScalarCollection when member.CollectionStyle == CollectionStyle.Wrapped:
+                    case MemberKind.ModelCollection when member.CollectionStyle == CollectionStyle.Wrapped:
+                        source.Append("                        EnsureCollection(frame, ").Append(index).AppendLine(");");
+                        source.Append("                        frame.CollectionMember = ").Append(index).AppendLine(";");
+                        source.AppendLine("                        frame.CollectionDepth = _depth;");
+                        break;
+                    case MemberKind.ScalarCollection:
+                        source.Append("                        EnsureCollection(frame, ").Append(index).AppendLine(");");
+                        source.Append("                        BeginScalarMember(frame, ").Append(index).AppendLine(", true);");
+                        break;
+                    case MemberKind.ModelCollection:
+                        source.Append("                        EnsureCollection(frame, ").Append(index).AppendLine(");");
+                        source.Append("                        StartModel(").Append(modelIndexes[member.ModelType!]).Append(", frame, ").Append(index).AppendLine(");");
+                        break;
+                }
+
+                source.AppendLine("                        return;");
+                source.AppendLine("                    }");
+            }
+
+            source.AppendLine("                    CaptureUnknown(frame, name);");
+            source.AppendLine("                    return;");
+        }
+
+        source.AppendLine("                default: throw new global::System.InvalidOperationException(\"Unknown generated model.\");");
+        source.AppendLine("            }");
+        source.AppendLine("        }");
+        source.AppendLine();
+    }
+
+    private static void EmitCollectionElementDispatch(
+        StringBuilder source,
+        List<ModelInfo> models,
+        Dictionary<INamedTypeSymbol, int> modelIndexes)
+    {
+        source.AppendLine("        private void DispatchCollectionElement(Frame frame, global::System.ReadOnlySpan<char> name)");
+        source.AppendLine("        {");
+        source.AppendLine("            if (TryStartSkip(frame, name)) return;");
+        source.AppendLine("            switch (frame.ModelIndex)");
+        source.AppendLine("            {");
+        foreach (var model in models)
+        {
+            source.Append("                case ").Append(model.Index).AppendLine(":");
+            for (var index = 0; index < model.Members.Count; index++)
+            {
+                var member = model.Members[index];
+                if (!member.IsCollection || member.CollectionStyle != CollectionStyle.Wrapped)
+                {
+                    continue;
+                }
+
+                source.Append("                    if (frame.CollectionMember == ").Append(index).Append(" && name.SequenceEqual(").Append(Literal(member.ItemElementName!)).AppendLine(".AsSpan()))");
+                source.AppendLine("                    {");
+                if (member.Kind == MemberKind.ScalarCollection)
+                {
+                    source.Append("                        BeginScalarMember(frame, ").Append(index).AppendLine(", true);");
+                }
+                else
+                {
+                    source.Append("                        StartModel(").Append(modelIndexes[member.ModelType!]).Append(", frame, ").Append(index).AppendLine(");");
+                }
+
+                source.AppendLine("                        return;");
+                source.AppendLine("                    }");
+            }
+
+            source.AppendLine("                    CaptureUnknown(frame, name);");
+            source.AppendLine("                    return;");
+        }
+
+        source.AppendLine("                default: throw new global::System.InvalidOperationException(\"Unknown generated model.\");");
+        source.AppendLine("            }");
+        source.AppendLine("        }");
+        source.AppendLine();
+    }
+
+    private static void EmitAttributeDispatch(StringBuilder source, List<ModelInfo> models)
+    {
+        source.AppendLine("        private void DispatchAttribute(Frame frame, global::System.ReadOnlySpan<char> name, global::System.ReadOnlySpan<char> value)");
+        source.AppendLine("        {");
+        source.AppendLine("            switch (frame.ModelIndex)");
+        source.AppendLine("            {");
+        foreach (var model in models)
+        {
+            source.Append("                case ").Append(model.Index).AppendLine(":");
+            for (var index = 0; index < model.Members.Count; index++)
+            {
+                var member = model.Members[index];
+                if (member.AttributeName is not null)
+                {
+                    source.Append("                    if (name.SequenceEqual(").Append(Literal(member.AttributeName)).Append(".AsSpan())) { SetScalarMember(frame, ").Append(index).AppendLine(", value); return; }");
+                }
+            }
+
+            source.AppendLine("                    return;");
+        }
+
+        source.AppendLine("                default: throw new global::System.InvalidOperationException(\"Unknown generated model.\");");
+        source.AppendLine("            }");
+        source.AppendLine("        }");
+        source.AppendLine();
+    }
+
+    private static void EmitScalarMemberSetter(StringBuilder source, List<ModelInfo> models)
+    {
+        source.AppendLine("        private void BeginScalarMember(Frame frame, int member, bool isCollection)");
+        source.AppendLine("        {");
+        source.AppendLine("            frame.CurrentMember = member;");
+        source.AppendLine("            frame.CurrentMemberDepth = _depth;");
+        source.AppendLine("            frame.CurrentMemberIsCollection = isCollection;");
+        source.AppendLine("        }");
+        source.AppendLine();
+        source.AppendLine("        private void SetScalarMember(Frame frame, int member, global::System.ReadOnlySpan<char> value)");
+        source.AppendLine("        {");
+        source.AppendLine("            switch (frame.ModelIndex)");
+        source.AppendLine("            {");
+        foreach (var model in models)
+        {
+            source.Append("                case ").Append(model.Index).AppendLine(":");
+            source.AppendLine("                    switch (member)");
+            source.AppendLine("                    {");
+            for (var index = 0; index < model.Members.Count; index++)
+            {
+                var member = model.Members[index];
+                if (member.Kind == MemberKind.Scalar)
+                {
+                    source.Append("                        case ").Append(index).Append(": ((").Append(FullyQualified(model.Symbol)).Append(")frame.Model).").Append(member.Symbol.Name).Append(" = ").Append(GetParseExpression(member.ScalarKind, member.ValueType)).AppendLine("; return;");
+                }
+            }
+
+            source.AppendLine("                        default: throw new global::System.InvalidOperationException(\"Unknown generated scalar member.\");");
+            source.AppendLine("                    }");
+        }
+
+        source.AppendLine("                default: throw new global::System.InvalidOperationException(\"Unknown generated model.\");");
+        source.AppendLine("            }");
+        source.AppendLine("        }");
+        source.AppendLine();
+    }
+
+    private static void EmitCollectionSupport(StringBuilder source, List<ModelInfo> models)
+    {
+        source.AppendLine("        private void EnsureCollection(Frame frame, int member)");
+        source.AppendLine("        {");
+        source.AppendLine("            switch (frame.ModelIndex)");
+        source.AppendLine("            {");
+        foreach (var model in models)
+        {
+            source.Append("                case ").Append(model.Index).AppendLine(":");
+            source.Append("                    frame.Collections ??= new object?[").Append(model.Members.Count).AppendLine("];");
+            source.AppendLine("                    switch (member)");
+            source.AppendLine("                    {");
+            for (var index = 0; index < model.Members.Count; index++)
+            {
+                var member = model.Members[index];
+                if (member.IsCollection)
+                {
+                    source.Append("                        case ").Append(index).Append(": if (frame.Collections[").Append(index).Append("] is null) frame.Collections[").Append(index).Append("] = new global::System.Collections.Generic.List<").Append(FullyQualified(member.ValueType)).AppendLine(">(); return;");
+                }
+            }
+
+            source.AppendLine("                        default: throw new global::System.InvalidOperationException(\"Unknown generated collection member.\");");
+            source.AppendLine("                    }");
+        }
+
+        source.AppendLine("                default: throw new global::System.InvalidOperationException(\"Unknown generated model.\");");
+        source.AppendLine("            }");
+        source.AppendLine("        }");
+        source.AppendLine();
+        source.AppendLine("        private void AddScalarCollectionMember(Frame frame, int member, global::System.ReadOnlySpan<char> value)");
+        source.AppendLine("        {");
+        source.AppendLine("            EnsureCollection(frame, member);");
+        source.AppendLine("            switch (frame.ModelIndex)");
+        source.AppendLine("            {");
+        foreach (var model in models)
+        {
+            source.Append("                case ").Append(model.Index).AppendLine(":");
+            source.AppendLine("                    switch (member)");
+            source.AppendLine("                    {");
+            for (var index = 0; index < model.Members.Count; index++)
+            {
+                var member = model.Members[index];
+                if (member.Kind == MemberKind.ScalarCollection)
+                {
+                    source.Append("                        case ").Append(index).Append(": ((global::System.Collections.Generic.List<").Append(FullyQualified(member.ValueType)).Append(">)frame.Collections![").Append(index).Append("]!).Add(").Append(GetParseExpression(member.ScalarKind, member.ValueType)).AppendLine("); return;");
+                }
+            }
+
+            source.AppendLine("                        default: throw new global::System.InvalidOperationException(\"Unknown generated scalar collection member.\");");
+            source.AppendLine("                    }");
+        }
+
+        source.AppendLine("                default: throw new global::System.InvalidOperationException(\"Unknown generated model.\");");
+        source.AppendLine("            }");
+        source.AppendLine("        }");
+        source.AppendLine();
+        source.AppendLine("        private void AssignCollections(Frame frame)");
+        source.AppendLine("        {");
+        source.AppendLine("            if (frame.Collections is null) return;");
+        source.AppendLine("            switch (frame.ModelIndex)");
+        source.AppendLine("            {");
+        foreach (var model in models)
+        {
+            source.Append("                case ").Append(model.Index).AppendLine(":");
+            for (var index = 0; index < model.Members.Count; index++)
+            {
+                var member = model.Members[index];
+                if (!member.IsCollection)
+                {
+                    continue;
+                }
+
+                var list = "((global::System.Collections.Generic.List<" + FullyQualified(member.ValueType) + ">)frame.Collections[" + index + "]!)";
+                source.Append("                    if (frame.Collections[").Append(index).Append("] is not null) ((").Append(FullyQualified(model.Symbol)).Append(")frame.Model).").Append(member.Symbol.Name).Append(" = ").Append(member.CollectionAssignmentKind == CollectionAssignmentKind.Array ? list + ".ToArray()" : list).AppendLine(";");
+            }
+
+            source.AppendLine("                    return;");
+        }
+
+        source.AppendLine("                default: throw new global::System.InvalidOperationException(\"Unknown generated model.\");");
+        source.AppendLine("            }");
+        source.AppendLine("        }");
+        source.AppendLine();
+    }
+
+    private static void EmitCompletedModelAttachment(
+        StringBuilder source,
+        List<ModelInfo> models,
+        Dictionary<INamedTypeSymbol, int> modelIndexes)
+    {
+        source.AppendLine("        private void AttachCompletedModel(Frame parent, int member, object completed)");
+        source.AppendLine("        {");
+        source.AppendLine("            switch (parent.ModelIndex)");
+        source.AppendLine("            {");
+        foreach (var model in models)
+        {
+            source.Append("                case ").Append(model.Index).AppendLine(":");
+            source.AppendLine("                    switch (member)");
+            source.AppendLine("                    {");
+            for (var index = 0; index < model.Members.Count; index++)
+            {
+                var member = model.Members[index];
+                if (member.Kind == MemberKind.Model)
+                {
+                    source.Append("                        case ").Append(index).Append(": ((").Append(FullyQualified(model.Symbol)).Append(")parent.Model).").Append(member.Symbol.Name).Append(" = (").Append(FullyQualified(member.ValueType)).AppendLine(")completed; return;");
+                }
+                else if (member.Kind == MemberKind.ModelCollection)
+                {
+                    source.Append("                        case ").Append(index).Append(": EnsureCollection(parent, ").Append(index).Append("); ((global::System.Collections.Generic.List<").Append(FullyQualified(member.ValueType)).Append(">)parent.Collections![").Append(index).Append("]!).Add((").Append(FullyQualified(member.ValueType)).AppendLine(")completed); return;");
+                }
+            }
+
+            source.AppendLine("                        default: throw new global::System.InvalidOperationException(\"Unknown generated model member.\");");
+            source.AppendLine("                    }");
+        }
+
+        source.AppendLine("                default: throw new global::System.InvalidOperationException(\"Unknown generated model.\");");
+        source.AppendLine("            }");
+        source.AppendLine("        }");
+        source.AppendLine();
+    }
+
+    private static void EmitUnknownCapture(StringBuilder source, List<ModelInfo> models)
+    {
+        source.AppendLine("        private void CaptureUnknown(Frame frame, global::System.ReadOnlySpan<char> name)");
+        source.AppendLine("        {");
+        source.AppendLine("            switch (frame.ModelIndex)");
+        source.AppendLine("            {");
+        foreach (var model in models.Where(static model => model.UnknownProperty is not null))
+        {
+            source.Append("                case ").Append(model.Index).AppendLine(":");
+            source.AppendLine("                {");
+            source.AppendLine("                    frame.UnknownDocument = new global::System.Xml.XmlDocument();");
+            source.AppendLine("                    var element = frame.UnknownDocument.CreateElement(name.ToString());");
+            source.AppendLine("                    frame.UnknownDocument.AppendChild(element);");
+            source.AppendLine("                    frame.UnknownStack = new global::System.Collections.Generic.List<global::System.Xml.XmlElement> { element };");
+            source.AppendLine("                    return;");
+            source.AppendLine("                }");
+        }
+
+        source.AppendLine("                default: return;");
+        source.AppendLine("            }");
+        source.AppendLine("        }");
+        source.AppendLine();
+        source.AppendLine("        private static void AddUnknownElement(Frame frame, global::System.ReadOnlySpan<char> name)");
+        source.AppendLine("        {");
+        source.AppendLine("            var element = frame.UnknownDocument!.CreateElement(name.ToString());");
+        source.AppendLine("            frame.UnknownStack![frame.UnknownStack.Count - 1].AppendChild(element);");
+        source.AppendLine("            frame.UnknownStack.Add(element);");
+        source.AppendLine("        }");
+        source.AppendLine("        private static void AddUnknownAttribute(Frame frame, global::System.ReadOnlySpan<char> name, global::System.ReadOnlySpan<char> value) => frame.UnknownStack![frame.UnknownStack.Count - 1].SetAttribute(name.ToString(), value.ToString());");
+        source.AppendLine("        private static void AddUnknownText(Frame frame, global::System.ReadOnlySpan<char> value) => frame.UnknownStack![frame.UnknownStack.Count - 1].AppendChild(frame.UnknownDocument!.CreateTextNode(value.ToString()));");
+        source.AppendLine("        private static void AddUnknownCData(Frame frame, global::System.ReadOnlySpan<char> value) => frame.UnknownStack![frame.UnknownStack.Count - 1].AppendChild(frame.UnknownDocument!.CreateCDataSection(value.ToString()));");
+        source.AppendLine("        private static void AddUnknownComment(Frame frame, global::System.ReadOnlySpan<char> value) => frame.UnknownStack![frame.UnknownStack.Count - 1].AppendChild(frame.UnknownDocument!.CreateComment(value.ToString()));");
+        source.AppendLine("        private static void EndUnknownElement(Frame frame)");
+        source.AppendLine("        {");
+        source.AppendLine("            var index = frame.UnknownStack!.Count - 1;");
+        source.AppendLine("            var element = frame.UnknownStack[index];");
+        source.AppendLine("            frame.UnknownStack.RemoveAt(index);");
+        source.AppendLine("            if (frame.UnknownStack.Count != 0) return;");
+        source.AppendLine("            (frame.UnknownElements ??= new global::System.Collections.Generic.List<global::System.Xml.XmlElement>()).Add(element);");
+        source.AppendLine("            frame.UnknownDocument = null;");
+        source.AppendLine("            frame.UnknownStack = null;");
+        source.AppendLine("        }");
+        source.AppendLine();
+        source.AppendLine("        private static void AssignUnknownElements(Frame frame)");
+        source.AppendLine("        {");
+        source.AppendLine("            if (frame.UnknownElements is not { Count: > 0 }) return;");
+        source.AppendLine("            switch (frame.ModelIndex)");
+        source.AppendLine("            {");
+        foreach (var model in models.Where(static model => model.UnknownProperty is not null))
+        {
+            source.Append("                case ").Append(model.Index).Append(": ((").Append(FullyQualified(model.Symbol)).Append(")frame.Model).").Append(model.UnknownProperty!.Name).AppendLine(" = frame.UnknownElements.ToArray(); return;");
+        }
+
+        source.AppendLine("                default: return;");
+        source.AppendLine("            }");
+        source.AppendLine("        }");
+        source.AppendLine();
+    }
+
+    private static string GetParseExpression(ScalarKind kind, ITypeSymbol type)
+    {
+        var targetType = FullyQualified(GetNonNullableType(type));
+        return kind switch
         {
             ScalarKind.String => "value.ToString()",
             ScalarKind.Boolean => "global::System.Xml.XmlConvert.ToBoolean(value.ToString())",
@@ -529,6 +990,56 @@ public sealed class TurboXmlSerializerGenerator : IIncrementalGenerator
         return kind != ScalarKind.None;
     }
 
+    private static CollectionInfo? GetCollectionInfo(ITypeSymbol type)
+    {
+        if (type is IArrayTypeSymbol array)
+        {
+            return new CollectionInfo(array.ElementType, CollectionAssignmentKind.Array);
+        }
+
+        if (type is not INamedTypeSymbol namedType)
+        {
+            return null;
+        }
+
+        var originalDefinition = namedType.OriginalDefinition.ToDisplayString();
+        if (originalDefinition == "System.Collections.Generic.List<T>")
+        {
+            return new CollectionInfo(namedType.TypeArguments[0], CollectionAssignmentKind.List);
+        }
+
+        if (namedType.TypeKind == TypeKind.Interface && IsListAssignableInterface(originalDefinition))
+        {
+            return new CollectionInfo(namedType.TypeArguments[0], CollectionAssignmentKind.List);
+        }
+
+        return null;
+    }
+
+    private static bool IsListAssignableInterface(string name)
+    {
+        return name == "System.Collections.Generic.IEnumerable<T>"
+            || name == "System.Collections.Generic.ICollection<T>"
+            || name == "System.Collections.Generic.IList<T>"
+            || name == "System.Collections.Generic.IReadOnlyCollection<T>"
+            || name == "System.Collections.Generic.IReadOnlyList<T>";
+    }
+
+    private static string GetDefaultElementName(ITypeSymbol type)
+    {
+        var nonNullable = GetNonNullableType(type);
+        return nonNullable.SpecialType switch
+        {
+            SpecialType.System_String => "string",
+            SpecialType.System_Boolean => "boolean",
+            SpecialType.System_Int32 => "int",
+            SpecialType.System_Int64 => "long",
+            SpecialType.System_Double => "double",
+            SpecialType.System_Decimal => "decimal",
+            _ => nonNullable.Name
+        };
+    }
+
     private static ITypeSymbol GetNonNullableType(ITypeSymbol type)
     {
         return type.OriginalDefinition.SpecialType == SpecialType.System_Nullable_T
@@ -536,8 +1047,6 @@ public sealed class TurboXmlSerializerGenerator : IIncrementalGenerator
             ? namedNullable.TypeArguments[0]
             : type;
     }
-
-    private static bool IsList(ITypeSymbol type) => type.AllInterfaces.Any(static interfaceType => interfaceType.OriginalDefinition.ToDisplayString() == "System.Collections.Generic.IList<T>");
 
     private static IEnumerable<IPropertySymbol> GetSerializableProperties(INamedTypeSymbol model)
     {
@@ -579,8 +1088,6 @@ public sealed class TurboXmlSerializerGenerator : IIncrementalGenerator
 
     private static string FullyQualified(ITypeSymbol symbol) => symbol.ToDisplayString(SymbolDisplayFormat.FullyQualifiedFormat);
 
-    private static string GetIdentifier(INamedTypeSymbol symbol) => symbol.Name + "TypeInfo";
-
     private static string Literal(string value) => SymbolDisplay.FormatLiteral(value, true);
 
     private sealed class ContextCandidate
@@ -607,7 +1114,8 @@ public sealed class TurboXmlSerializerGenerator : IIncrementalGenerator
             RootName = rootName;
             Members = members;
             UnknownProperty = unknownProperty;
-            SkipElements = skipElements;
+            SkipElements = skipElements.IsDefault ? ImmutableArray<string>.Empty : skipElements;
+            Identifier = string.Empty;
         }
 
         public INamedTypeSymbol Symbol { get; }
@@ -619,16 +1127,36 @@ public sealed class TurboXmlSerializerGenerator : IIncrementalGenerator
         public IPropertySymbol? UnknownProperty { get; }
 
         public ImmutableArray<string> SkipElements { get; }
+
+        public int Index { get; set; }
+
+        public string Identifier { get; set; }
     }
 
     private sealed class MemberInfo
     {
-        public MemberInfo(IPropertySymbol symbol, string? attributeName, string? elementName, ScalarKind kind)
+        public MemberInfo(
+            IPropertySymbol symbol,
+            string? attributeName,
+            string? elementName,
+            MemberKind kind,
+            ScalarKind scalarKind,
+            ITypeSymbol valueType,
+            INamedTypeSymbol? modelType,
+            CollectionStyle collectionStyle,
+            string? itemElementName,
+            CollectionAssignmentKind collectionAssignmentKind)
         {
             Symbol = symbol;
             AttributeName = attributeName;
             ElementName = elementName;
             Kind = kind;
+            ScalarKind = scalarKind;
+            ValueType = valueType;
+            ModelType = modelType;
+            CollectionStyle = collectionStyle;
+            ItemElementName = itemElementName;
+            CollectionAssignmentKind = collectionAssignmentKind;
         }
 
         public IPropertySymbol Symbol { get; }
@@ -637,7 +1165,56 @@ public sealed class TurboXmlSerializerGenerator : IIncrementalGenerator
 
         public string? ElementName { get; }
 
-        public ScalarKind Kind { get; }
+        public MemberKind Kind { get; }
+
+        public ScalarKind ScalarKind { get; }
+
+        public ITypeSymbol ValueType { get; }
+
+        public INamedTypeSymbol? ModelType { get; }
+
+        public CollectionStyle CollectionStyle { get; }
+
+        public string? ItemElementName { get; }
+
+        public CollectionAssignmentKind CollectionAssignmentKind { get; }
+
+        public bool IsCollection => Kind == MemberKind.ScalarCollection || Kind == MemberKind.ModelCollection;
+    }
+
+    private sealed class CollectionInfo
+    {
+        public CollectionInfo(ITypeSymbol elementType, CollectionAssignmentKind assignmentKind)
+        {
+            ElementType = elementType;
+            AssignmentKind = assignmentKind;
+        }
+
+        public ITypeSymbol ElementType { get; }
+
+        public CollectionAssignmentKind AssignmentKind { get; }
+    }
+
+    private enum MemberKind
+    {
+        Scalar,
+        Model,
+        ScalarCollection,
+        ModelCollection
+    }
+
+    private enum CollectionStyle
+    {
+        None,
+        Wrapped,
+        Flat
+    }
+
+    private enum CollectionAssignmentKind
+    {
+        None,
+        Array,
+        List
     }
 
     private enum ScalarKind
