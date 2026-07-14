@@ -53,12 +53,62 @@ struct MyXmlHandler : IXmlReadHandler
         => Console.WriteLine($"Content({line + 1}:{column + 1}): {text}");
 }
 ```
+
+### Generated deserialization
+
+`TurboXml.Serialization.Generator` provides an AOT-friendly, source-generated deserialization path for models that use standard `System.Xml.Serialization` attributes. Add it as an analyzer reference to the consuming project, then declare a partial context:
+
+```xml
+<ProjectReference Include="..\TurboXml.Serialization.Generator\TurboXml.Serialization.Generator.csproj"
+                  OutputItemType="Analyzer"
+                  ReferenceOutputAssembly="false" />
+```
+
+```c#
+using System.Xml.Serialization;
+using TurboXml.Serialization;
+
+[TurboXmlSerializable(typeof(Connection))]
+[TurboXmlSkipUnknownElement(typeof(Connection), "Stamp")]
+internal sealed partial class ConnectionContext : TurboXmlSerializerContext
+{
+    public static ConnectionContext Default { get; } = new();
+}
+
+[XmlRoot("Connection")]
+public sealed class Connection
+{
+    [XmlAttribute("id")]
+    public int Id { get; set; }
+
+    public string Name { get; set; } = string.Empty;
+
+    [XmlAnyElement]
+    public XmlElement[]? UnknownProperties { get; set; }
+}
+
+var connection = TurboXmlSerializer.Deserialize(
+    xml,
+    ConnectionContext.Default.ConnectionTypeInfo);
+```
+
+The generated handler compares names as spans and assigns known scalar values directly. It can also deserialize root collections with `TurboXmlSerializer.DeserializeArray`. Configured skip names are ignored before unknown-element handling. `[XmlAnyElement]` creates `XmlDocument` nodes only after an unknown subtree is encountered, preserving the allocation-light fast path for known XML.
+
+The current generated subset supports root models with scalar element and attribute values, enums, root arrays, `XmlAnyElement`, and named unknown-element skips. Unsupported nested or model-owned collection properties report a source-generator diagnostic rather than falling back to reflection.
+
 ## 📊 Benchmarks
 
 The solution contains 2 benchmarks:
 
 - `BenchStream` that parses 240+ MSBuild xml files (targets and props) from the .NET 8 (or latest SDK) installed
 - `BenchString` that parses the `Tiger.svg` in memory from a string.
+- `BenchConnectionLoaderString` and `BenchConnectionLoaderStream` that compare a custom `XmlReader` connection loader with the generated TurboXml reader for known single objects, root arrays, and unknown extension elements.
+
+Run the Connection-loader comparison non-interactively with allocation diagnostics:
+
+```console
+$ dotnet run --project src/TurboXml.Bench -c Release -- --filter "*BenchConnectionLoader*" --job Short --noOverwrite
+```
 
 In general, the advantages of `TurboXml` over `System.Xml.XmlReader`:
 

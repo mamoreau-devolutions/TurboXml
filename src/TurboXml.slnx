@@ -13,6 +13,7 @@
   </Folder>
   <Project Path="TurboXml.Bench/TurboXml.Bench.csproj" />
   <Project Path="TurboXml.CodeGen/TurboXml.CodeGen.csproj" />
+  <Project Path="TurboXml.Serialization.Generator/TurboXml.Serialization.Generator.csproj" />
   <Project Path="TurboXml.Tests/TurboXml.Tests.csproj" />
   <Project Path="TurboXml/TurboXml.csproj" />
 </Solution>
