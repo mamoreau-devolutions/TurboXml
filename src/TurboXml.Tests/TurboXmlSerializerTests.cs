@@ -76,6 +76,8 @@ public sealed class TurboXmlSerializerTests
                            <Connection id="7">
                              <Name>Compatibility</Name>
                              <Enabled>false</Enabled>
+                             <Port>65535</Port>
+                             <Resolution>1080</Resolution>
                              <Protocol>Rdp</Protocol>
                              <AlternateProtocol>Telnet</AlternateProtocol>
                              <Protocols><Protocol>Rdp</Protocol><Protocol>Ssh</Protocol></Protocols>
@@ -93,6 +95,8 @@ public sealed class TurboXmlSerializerTests
         Assert.AreEqual(framework.Id, generated.Id);
         Assert.AreEqual(framework.Name, generated.Name);
         Assert.AreEqual(framework.Enabled, generated.Enabled);
+        Assert.AreEqual(framework.Port, generated.Port);
+        Assert.AreEqual(framework.Resolution, generated.Resolution);
         Assert.AreEqual(framework.Protocol, generated.Protocol);
         Assert.AreEqual(framework.AlternateProtocol, generated.AlternateProtocol);
         Assert.IsNotNull(framework.Protocols);
@@ -213,6 +217,10 @@ public sealed class ConnectionFixture : ConnectionFixtureBase
     public string Name { get; set; } = string.Empty;
 
     public bool Enabled { get; set; }
+
+    public ushort Port { get; set; }
+
+    public ushort? Resolution { get; set; }
 
     public ConnectionProtocol Protocol { get; set; }
 

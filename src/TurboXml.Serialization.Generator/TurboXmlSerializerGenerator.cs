@@ -952,6 +952,7 @@ public sealed class TurboXmlSerializerGenerator : IIncrementalGenerator
         {
             ScalarKind.String => "value.ToString()",
             ScalarKind.Boolean => "global::System.Xml.XmlConvert.ToBoolean(value.ToString())",
+            ScalarKind.UInt16 => "ushort.Parse(value, global::System.Globalization.CultureInfo.InvariantCulture)",
             ScalarKind.Int32 => "int.Parse(value, global::System.Globalization.CultureInfo.InvariantCulture)",
             ScalarKind.Int64 => "long.Parse(value, global::System.Globalization.CultureInfo.InvariantCulture)",
             ScalarKind.Double => "double.Parse(value, global::System.Globalization.CultureInfo.InvariantCulture)",
@@ -985,6 +986,7 @@ public sealed class TurboXmlSerializerGenerator : IIncrementalGenerator
         {
             SpecialType.System_String => ScalarKind.String,
             SpecialType.System_Boolean => ScalarKind.Boolean,
+            SpecialType.System_UInt16 => ScalarKind.UInt16,
             SpecialType.System_Int32 => ScalarKind.Int32,
             SpecialType.System_Int64 => ScalarKind.Int64,
             SpecialType.System_Double => ScalarKind.Double,
@@ -1044,6 +1046,7 @@ public sealed class TurboXmlSerializerGenerator : IIncrementalGenerator
         {
             SpecialType.System_String => "string",
             SpecialType.System_Boolean => "boolean",
+            SpecialType.System_UInt16 => "unsignedShort",
             SpecialType.System_Int32 => "int",
             SpecialType.System_Int64 => "long",
             SpecialType.System_Double => "double",
@@ -1234,6 +1237,7 @@ public sealed class TurboXmlSerializerGenerator : IIncrementalGenerator
         None,
         String,
         Boolean,
+        UInt16,
         Int32,
         Int64,
         Double,
