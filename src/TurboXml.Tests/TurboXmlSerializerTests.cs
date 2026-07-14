@@ -199,6 +199,28 @@ public sealed class TurboXmlSerializerTests
 
         Assert.AreEqual("settings.example.com", result.Host);
     }
+
+    [TestMethod]
+    public void Deserialize_UsesXmlTypeNameForRootWhenXmlRootNameIsImplicit()
+    {
+        const string typeOnlyXml = """<type-only-list><Name>Type only</Name></type-only-list>""";
+        const string xmlTypeAndRootXml = """<list><Name>Type and root</Name></list>""";
+
+        var typeOnlyGenerated = TurboXmlSerializer.Deserialize(typeOnlyXml, XmlTypeRootFixtureContext.Default.XmlTypeOnlyFixtureTypeInfo);
+        var typeOnlyFramework = DeserializeWithXmlSerializer<XmlTypeOnlyFixture>(typeOnlyXml);
+        var xmlTypeAndRootGenerated = TurboXmlSerializer.Deserialize(xmlTypeAndRootXml, XmlTypeRootFixtureContext.Default.XmlTypeAndRootFixtureTypeInfo);
+        var xmlTypeAndRootFramework = DeserializeWithXmlSerializer<XmlTypeAndRootFixture>(xmlTypeAndRootXml);
+
+        Assert.AreEqual(typeOnlyFramework.Name, typeOnlyGenerated.Name);
+        Assert.AreEqual(xmlTypeAndRootFramework.Name, xmlTypeAndRootGenerated.Name);
+    }
+
+    private static T DeserializeWithXmlSerializer<T>(string xml)
+    {
+        var serializer = new XmlSerializer(typeof(T));
+        using var reader = new StringReader(xml);
+        return (T)serializer.Deserialize(reader)!;
+    }
 }
 
 [TurboXmlSerializable(typeof(ConnectionFixture))]
@@ -255,6 +277,26 @@ public enum AlternateConnectionProtocol
 {
     None,
     Telnet
+}
+
+[TurboXmlSerializable(typeof(XmlTypeOnlyFixture))]
+[TurboXmlSerializable(typeof(XmlTypeAndRootFixture))]
+internal sealed partial class XmlTypeRootFixtureContext : TurboXmlSerializerContext
+{
+    public static XmlTypeRootFixtureContext Default { get; } = new();
+}
+
+[XmlType("type-only-list")]
+public sealed class XmlTypeOnlyFixture
+{
+    public string Name { get; set; } = string.Empty;
+}
+
+[XmlType("list")]
+[XmlRoot(Namespace = "", IsNullable = false)]
+public sealed class XmlTypeAndRootFixture
+{
+    public string Name { get; set; } = string.Empty;
 }
 
 [TurboXmlSerializable(typeof(Connection))]

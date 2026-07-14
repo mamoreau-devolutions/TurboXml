@@ -318,7 +318,10 @@ public sealed class TurboXmlSerializerGenerator : IIncrementalGenerator
         }
 
         var rootAttribute = GetAttribute(model, "System.Xml.Serialization.XmlRootAttribute");
-        var rootName = rootAttribute is null ? model.Name : GetXmlName(rootAttribute, model.Name);
+        var typeAttribute = GetAttribute(model, "System.Xml.Serialization.XmlTypeAttribute");
+        var rootName = GetExplicitXmlRootName(rootAttribute)
+            ?? GetXmlTypeName(typeAttribute)
+            ?? model.Name;
         skipElements.TryGetValue(model, out var skips);
         return new ModelInfo(model, rootName, members, unknownProperty, skips);
     }
@@ -1099,6 +1102,37 @@ public sealed class TurboXmlSerializerGenerator : IIncrementalGenerator
         }
 
         return fallback;
+    }
+
+    private static string? GetExplicitXmlRootName(AttributeData? attribute) => GetExplicitXmlName(attribute, "ElementName");
+
+    private static string? GetXmlTypeName(AttributeData? attribute) => GetExplicitXmlName(attribute, "TypeName");
+
+    private static string? GetExplicitXmlName(AttributeData? attribute, string namedArgument)
+    {
+        if (attribute is null)
+        {
+            return null;
+        }
+
+        if (attribute.ConstructorArguments.Length > 0
+            && attribute.ConstructorArguments[0].Value is string name
+            && name.Length > 0)
+        {
+            return name;
+        }
+
+        foreach (var pair in attribute.NamedArguments)
+        {
+            if (pair.Key == namedArgument
+                && pair.Value.Value is string namedXmlName
+                && namedXmlName.Length > 0)
+            {
+                return namedXmlName;
+            }
+        }
+
+        return null;
     }
 
     private static string FullyQualified(ITypeSymbol symbol) => symbol.ToDisplayString(SymbolDisplayFormat.FullyQualifiedFormat);
