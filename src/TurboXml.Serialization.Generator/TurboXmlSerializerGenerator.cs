@@ -238,7 +238,7 @@ public sealed class TurboXmlSerializerGenerator : IIncrementalGenerator
             }
 
             string? propertyNameArgument = null;
-            string? additionalAttributesArgument = null;
+            string? xmlAttributeStringsArgument = null;
             foreach (var namedArgument in attribute.NamedArguments)
             {
                 if (namedArgument.Key == "PropertyNameArgument")
@@ -256,20 +256,20 @@ public sealed class TurboXmlSerializerGenerator : IIncrementalGenerator
 
                     propertyNameArgument = configuredPropertyNameArgument;
                 }
-                else if (namedArgument.Key == "AdditionalAttributesArgument")
+                else if (namedArgument.Key == "XmlAttributeStringsArgument")
                 {
-                    if (namedArgument.Value.Value is not string configuredAdditionalAttributesArgument
-                        || string.IsNullOrWhiteSpace(configuredAdditionalAttributesArgument))
+                    if (namedArgument.Value.Value is not string configuredXmlAttributeStringsArgument
+                        || string.IsNullOrWhiteSpace(configuredXmlAttributeStringsArgument))
                     {
                         context.ReportDiagnostic(Diagnostic.Create(
                             InvalidFieldBackedPropertyConfiguration,
                             candidate.Symbol.Locations.FirstOrDefault(),
                             candidate.Symbol.Name,
-                            "the additional-attributes argument convention must be a non-empty string"));
+                            "the XML attribute strings argument convention must be a non-empty string"));
                         return null;
                     }
 
-                    additionalAttributesArgument = configuredAdditionalAttributesArgument;
+                    xmlAttributeStringsArgument = configuredXmlAttributeStringsArgument;
                 }
             }
 
@@ -285,7 +285,7 @@ public sealed class TurboXmlSerializerGenerator : IIncrementalGenerator
 
             configurations.Add(
                 markerAttributeMetadataName,
-                new FieldBackedPropertyConfiguration(propertyNameArgument, additionalAttributesArgument));
+                new FieldBackedPropertyConfiguration(propertyNameArgument, xmlAttributeStringsArgument));
         }
 
         return configurations;
@@ -1320,21 +1320,21 @@ public sealed class TurboXmlSerializerGenerator : IIncrementalGenerator
     {
         xmlElementName = null;
         error = string.Empty;
-        if (configuration.AdditionalAttributesArgument is null)
+        if (configuration.XmlAttributeStringsArgument is null)
         {
             return true;
         }
 
         foreach (var namedArgument in markerAttribute.NamedArguments)
         {
-            if (namedArgument.Key != configuration.AdditionalAttributesArgument)
+            if (namedArgument.Key != configuration.XmlAttributeStringsArgument)
             {
                 continue;
             }
 
             if (namedArgument.Value.Kind != TypedConstantKind.Array || namedArgument.Value.Values.IsDefault)
             {
-                error = $"the '{configuration.AdditionalAttributesArgument}' marker argument must be a string collection";
+                error = $"the '{configuration.XmlAttributeStringsArgument}' marker argument must be a string collection";
                 return false;
             }
 
@@ -1343,13 +1343,13 @@ public sealed class TurboXmlSerializerGenerator : IIncrementalGenerator
                 if (additionalAttribute.Value is not string additionalAttributeText
                     || !TryParseXmlElementOverride(additionalAttributeText, out var parsedXmlElementName))
                 {
-                    error = $"the '{configuration.AdditionalAttributesArgument}' marker argument supports only XmlElement(\"name\") declarations";
+                    error = $"the '{configuration.XmlAttributeStringsArgument}' marker argument supports only XmlElement(\"name\") declarations";
                     return false;
                 }
 
                 if (xmlElementName is not null)
                 {
-                    error = $"the '{configuration.AdditionalAttributesArgument}' marker argument can specify XmlElement only once";
+                    error = $"the '{configuration.XmlAttributeStringsArgument}' marker argument can specify XmlElement only once";
                     return false;
                 }
 
@@ -1620,15 +1620,15 @@ public sealed class TurboXmlSerializerGenerator : IIncrementalGenerator
 
     private sealed class FieldBackedPropertyConfiguration
     {
-        public FieldBackedPropertyConfiguration(string? propertyNameArgument, string? additionalAttributesArgument)
+        public FieldBackedPropertyConfiguration(string? propertyNameArgument, string? xmlAttributeStringsArgument)
         {
             PropertyNameArgument = propertyNameArgument;
-            AdditionalAttributesArgument = additionalAttributesArgument;
+            XmlAttributeStringsArgument = xmlAttributeStringsArgument;
         }
 
         public string? PropertyNameArgument { get; }
 
-        public string? AdditionalAttributesArgument { get; }
+        public string? XmlAttributeStringsArgument { get; }
     }
 
     private sealed class CollectionInfo

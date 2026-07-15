@@ -52,5 +52,5 @@ public sealed class TurboXmlFieldBackedPropertyAttribute : Attribute
     /// The named argument must be a collection of strings in the form <c>XmlElement("name")</c>. TurboXml
     /// uses the configured XML element name without evaluating source text or using reflection.
     /// </remarks>
-    public string? AdditionalAttributesArgument { get; set; }
+    public string? XmlAttributeStringsArgument { get; set; }
 }

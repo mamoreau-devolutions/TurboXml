@@ -222,6 +222,7 @@ public sealed class TurboXmlSerializerTests
         const string xml = """
                            <FieldBackedConnection>
                              <remote-desktop><Host>rdp.example.com</Host><Port>3389</Port></remote-desktop>
+                             <JumpConnection><Host>jump.example.com</Host><Port>3390</Port></JumpConnection>
                              <Credentials><User>administrator</User></Credentials>
                              <AddOns>
                                <FieldBackedAddOnFixture><Name>Gateway</Name></FieldBackedAddOnFixture>
@@ -236,10 +237,13 @@ public sealed class TurboXmlSerializerTests
         var result = TurboXmlSerializer.Deserialize(xml, FieldBackedConnectionFixtureContext.Default.FieldBackedConnectionFixtureTypeInfo);
 
         var rdp = result.RDP ?? throw new InvalidOperationException("RDP was not deserialized.");
+        var jump = result.Jump ?? throw new InvalidOperationException("Jump was not deserialized.");
         var credentials = result.Credentials ?? throw new InvalidOperationException("Credentials were not deserialized.");
         var addOns = result.AddOns ?? throw new InvalidOperationException("Add-ons were not deserialized.");
         Assert.AreEqual("rdp.example.com", rdp.Host);
         Assert.AreEqual(3389, rdp.Port);
+        Assert.AreEqual("jump.example.com", jump.Host);
+        Assert.AreEqual(3390, jump.Port);
         Assert.AreEqual("administrator", credentials.User);
         Assert.HasCount(2, addOns);
         Assert.AreEqual("Clipboard", addOns[1].Name);
@@ -395,7 +399,7 @@ public sealed class ConnectionEndpointFixture
 [TurboXmlFieldBackedProperty(
     "Devolutions.Roslyn.Attributes.GenerateLazyPropertyAttribute",
     PropertyNameArgument = "PropertyName",
-    AdditionalAttributesArgument = "AdditionalAttributes")]
+    XmlAttributeStringsArgument = "AdditionalAttributes")]
 internal sealed partial class FieldBackedConnectionFixtureContext : TurboXmlSerializerContext
 {
     public static FieldBackedConnectionFixtureContext Default { get; } = new();
@@ -406,6 +410,9 @@ public sealed class FieldBackedConnectionFixture
 {
     [GenerateLazyProperty(PropertyName = "RDP", AdditionalAttributes = new[] { "XmlElement(\"remote-desktop\")" })]
     private RdpConnectionFixture? rdp;
+
+    [GenerateLazyProperty(AdditionalAttributes = new[] { "XmlElement(\"JumpConnection\")" })]
+    private RdpConnectionFixture? jump;
 
     [GenerateLazyProperty]
     private FieldBackedCredentialFixture? credentials;
@@ -427,6 +434,13 @@ public sealed class FieldBackedConnectionFixture
     {
         get => rdp;
         set => rdp = value;
+    }
+
+    [XmlIgnore]
+    public RdpConnectionFixture? Jump
+    {
+        get => jump;
+        set => jump = value;
     }
 
     [XmlIgnore]
