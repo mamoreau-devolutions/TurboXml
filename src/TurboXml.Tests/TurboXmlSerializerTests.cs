@@ -1,4 +1,5 @@
 using Devolutions.Roslyn.Attributes;
+using System.Text.Json.Serialization;
 using System.Xml;
 using System.Xml.Serialization;
 using TurboXml.Serialization;
@@ -411,7 +412,13 @@ public sealed class FieldBackedConnectionFixture
     [GenerateLazyProperty(PropertyName = "RDP", AdditionalAttributes = new[] { "XmlElement(\"remote-desktop\")" })]
     private RdpConnectionFixture? rdp;
 
-    [GenerateLazyProperty(AdditionalAttributes = new[] { "XmlElement(\"JumpConnection\")" })]
+    [GenerateLazyProperty(AdditionalAttributes = new[]
+    {
+        nameof(PSExclude),
+        nameof(JsonIgnoreAttribute),
+        nameof(GeneratedLazyPropertyAttribute),
+        "  XmlElement(\"JumpConnection\")  "
+    })]
     private RdpConnectionFixture? jump;
 
     [GenerateLazyProperty]
@@ -494,4 +501,12 @@ public sealed class FieldBackedCredentialFixture
 public sealed class FieldBackedAddOnFixture
 {
     public string Name { get; set; } = string.Empty;
+}
+
+public sealed class PSExclude
+{
+}
+
+public sealed class GeneratedLazyPropertyAttribute
+{
 }

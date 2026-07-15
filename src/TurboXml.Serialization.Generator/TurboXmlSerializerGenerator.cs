@@ -1332,31 +1332,68 @@ public sealed class TurboXmlSerializerGenerator : IIncrementalGenerator
                 continue;
             }
 
-            if (namedArgument.Value.Kind != TypedConstantKind.Array || namedArgument.Value.Values.IsDefault)
+            if (namedArgument.Value.Kind != TypedConstantKind.Array)
             {
-                error = $"the '{configuration.XmlAttributeStringsArgument}' marker argument must be a string collection";
+                if (namedArgument.Value.Value is not string xmlAttributeString)
+                {
+                    error = $"the '{configuration.XmlAttributeStringsArgument}' marker argument must be a string or string collection";
+                    return false;
+                }
+
+                if (!TryApplyXmlAttributeString(xmlAttributeString, configuration.XmlAttributeStringsArgument, ref xmlElementName, out error))
+                {
+                    return false;
+                }
+
+                continue;
+            }
+
+            if (namedArgument.Value.Values.IsDefault)
+            {
+                error = $"the '{configuration.XmlAttributeStringsArgument}' marker argument must be a string or string collection";
                 return false;
             }
 
-            foreach (var additionalAttribute in namedArgument.Value.Values)
+            foreach (var xmlAttributeStringValue in namedArgument.Value.Values)
             {
-                if (additionalAttribute.Value is not string additionalAttributeText
-                    || !TryParseXmlElementOverride(additionalAttributeText, out var parsedXmlElementName))
+                if (xmlAttributeStringValue.Value is not string additionalAttributeText
+                    || !TryApplyXmlAttributeString(additionalAttributeText, configuration.XmlAttributeStringsArgument, ref xmlElementName, out error))
                 {
-                    error = $"the '{configuration.XmlAttributeStringsArgument}' marker argument supports only XmlElement(\"name\") declarations";
                     return false;
                 }
-
-                if (xmlElementName is not null)
-                {
-                    error = $"the '{configuration.XmlAttributeStringsArgument}' marker argument can specify XmlElement only once";
-                    return false;
-                }
-
-                xmlElementName = parsedXmlElementName;
             }
         }
 
+        return true;
+    }
+
+    private static bool TryApplyXmlAttributeString(
+        string value,
+        string argumentName,
+        ref string? xmlElementName,
+        out string error)
+    {
+        var text = value.Trim();
+        if (!text.StartsWith("Xml", StringComparison.Ordinal))
+        {
+            error = string.Empty;
+            return true;
+        }
+
+        if (!TryParseXmlElementOverride(text, out var parsedXmlElementName))
+        {
+            error = $"the '{argumentName}' marker argument supports only XmlElement(\"name\") declarations";
+            return false;
+        }
+
+        if (xmlElementName is not null)
+        {
+            error = $"the '{argumentName}' marker argument can specify XmlElement only once";
+            return false;
+        }
+
+        xmlElementName = parsedXmlElementName;
+        error = string.Empty;
         return true;
     }
 
@@ -1373,7 +1410,9 @@ public sealed class TurboXmlSerializerGenerator : IIncrementalGenerator
         }
 
         xmlElementName = text.Substring(prefix.Length, text.Length - prefix.Length - suffix.Length);
-        return xmlElementName.IndexOf('"') < 0 && xmlElementName.IndexOf('\\') < 0;
+        return !string.IsNullOrWhiteSpace(xmlElementName)
+            && xmlElementName.IndexOf('"') < 0
+            && xmlElementName.IndexOf('\\') < 0;
     }
 
     private static bool TryValidateGeneratedPropertyName(string name, out string propertyName, out string error)

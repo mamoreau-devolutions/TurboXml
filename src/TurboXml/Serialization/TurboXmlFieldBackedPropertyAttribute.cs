@@ -49,8 +49,9 @@ public sealed class TurboXmlFieldBackedPropertyAttribute : Attribute
     /// Gets or sets the optional named argument on the marker attribute that supplies restricted XML member overrides.
     /// </summary>
     /// <remarks>
-    /// The named argument must be a collection of strings in the form <c>XmlElement("name")</c>. TurboXml
-    /// uses the configured XML element name without evaluating source text or using reflection.
+    /// The named argument may be a string or string collection. TurboXml ignores non-XML strings and accepts
+    /// <c>XmlElement("name")</c> declarations, using the configured XML element name without evaluating source
+    /// text or using reflection.
     /// </remarks>
     public string? XmlAttributeStringsArgument { get; set; }
 }
