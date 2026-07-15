@@ -2,6 +2,7 @@ using System.Text;
 using System.Xml;
 using System.Xml.Serialization;
 using BenchmarkDotNet.Attributes;
+using TurboXml;
 using TurboXml.Serialization;
 
 namespace TurboXml.Bench;
@@ -52,6 +53,64 @@ public class BenchConnectionLoaderStream
     {
         using var stream = new MemoryStream(_xml, writable: false);
         return ConnectionLoaderFixture.LoadWithCustomLoader(stream, Scenario);
+    }
+
+    [Benchmark(Description = "Generated TurboXml reader")]
+    public int GeneratedTurboXml()
+    {
+        using var stream = new MemoryStream(_xml, writable: false);
+        return ConnectionLoaderFixture.LoadWithTurboXml(stream, Scenario);
+    }
+}
+
+[MemoryDiagnoser(displayGenColumns: false)]
+public class BenchTurboXmlSerializerString
+{
+    [ParamsAllValues]
+    public ConnectionLoaderScenario Scenario { get; set; }
+
+    private string _xml = null!;
+
+    [GlobalSetup]
+    public void Setup()
+    {
+        _xml = ConnectionLoaderFixture.CreateXml(Scenario);
+        ConnectionLoaderFixture.ValidateTurboXmlCallback(_xml, Scenario);
+    }
+
+    [Benchmark(Baseline = true, Description = "TurboXml callback loader")]
+    public int TurboXmlCallback()
+    {
+        return ConnectionLoaderFixture.LoadWithTurboXmlCallback(_xml, Scenario);
+    }
+
+    [Benchmark(Description = "Generated TurboXml reader")]
+    public int GeneratedTurboXml()
+    {
+        return ConnectionLoaderFixture.LoadWithTurboXml(_xml, Scenario);
+    }
+}
+
+[MemoryDiagnoser(displayGenColumns: false)]
+public class BenchTurboXmlSerializerStream
+{
+    [ParamsAllValues]
+    public ConnectionLoaderScenario Scenario { get; set; }
+
+    private byte[] _xml = null!;
+
+    [GlobalSetup]
+    public void Setup()
+    {
+        _xml = Encoding.UTF8.GetBytes(ConnectionLoaderFixture.CreateXml(Scenario));
+        ConnectionLoaderFixture.ValidateTurboXmlCallback(Encoding.UTF8.GetString(_xml), Scenario);
+    }
+
+    [Benchmark(Baseline = true, Description = "TurboXml callback loader")]
+    public int TurboXmlCallback()
+    {
+        using var stream = new MemoryStream(_xml, writable: false);
+        return ConnectionLoaderFixture.LoadWithTurboXmlCallback(stream, Scenario);
     }
 
     [Benchmark(Description = "Generated TurboXml reader")]
@@ -114,6 +173,34 @@ public static class ConnectionLoaderFixture
         return scenario == ConnectionLoaderScenario.ConnectionArray
             ? Checksum(TurboXmlSerializer.DeserializeArray(stream, "Connection", ConnectionLoaderContext.Default.ConnectionBenchModelTypeInfo))
             : Checksum(TurboXmlSerializer.Deserialize(stream, ConnectionLoaderContext.Default.ConnectionBenchModelTypeInfo));
+    }
+
+    public static int LoadWithTurboXmlCallback(string xml, ConnectionLoaderScenario scenario)
+    {
+        var handler = new CustomConnectionLoader.TurboXmlCallbackConnectionLoader(scenario == ConnectionLoaderScenario.ConnectionArray);
+        XmlParser.Parse(xml, ref handler);
+        return scenario == ConnectionLoaderScenario.ConnectionArray
+            ? Checksum(handler.GetArrayResult())
+            : Checksum(handler.GetResult());
+    }
+
+    public static int LoadWithTurboXmlCallback(Stream stream, ConnectionLoaderScenario scenario)
+    {
+        var handler = new CustomConnectionLoader.TurboXmlCallbackConnectionLoader(scenario == ConnectionLoaderScenario.ConnectionArray);
+        XmlParser.Parse(stream, ref handler);
+        return scenario == ConnectionLoaderScenario.ConnectionArray
+            ? Checksum(handler.GetArrayResult())
+            : Checksum(handler.GetResult());
+    }
+
+    public static void ValidateTurboXmlCallback(string xml, ConnectionLoaderScenario scenario)
+    {
+        var generated = LoadWithTurboXml(xml, scenario);
+        var callback = LoadWithTurboXmlCallback(xml, scenario);
+        if (callback != generated)
+        {
+            throw new InvalidOperationException($"TurboXml callback and generated readers produced different checksums: {callback} and {generated}.");
+        }
     }
 
     private static int Checksum(ConnectionBenchModel connection)
@@ -292,6 +379,231 @@ internal static class CustomConnectionLoader
 
         return result;
     }
+
+    internal struct TurboXmlCallbackConnectionLoader : IXmlReadHandler
+        {
+            private readonly bool _isArray;
+            private int _depth;
+            private int _connectionDepth;
+            private int _skipDepth;
+            private ConnectionBenchModel? _current;
+            private ConnectionBenchModel? _result;
+            private List<ConnectionBenchModel>? _results;
+            private string? _currentMember;
+            private XmlDocument? _unknownDocument;
+            private List<XmlElement>? _unknownStack;
+            private List<XmlElement>? _unknownElements;
+
+            public TurboXmlCallbackConnectionLoader(bool isArray)
+            {
+                _isArray = isArray;
+            }
+
+            public void OnBeginTag(ReadOnlySpan<char> name, int line, int column)
+            {
+                _depth++;
+                if (_unknownStack is not null)
+                {
+                    AddUnknownElement(name);
+                    return;
+                }
+
+                if (_skipDepth != 0)
+                {
+                    return;
+                }
+
+                if (_current is null)
+                {
+                    if ((!_isArray && _depth == 1 && name.SequenceEqual("Connection".AsSpan()))
+                        || (_isArray && _depth == 2 && name.SequenceEqual("Connection".AsSpan())))
+                    {
+                        _current = new ConnectionBenchModel();
+                        _connectionDepth = _depth;
+                    }
+
+                    return;
+                }
+
+                if (_depth != _connectionDepth + 1)
+                {
+                    return;
+                }
+
+                _currentMember = name.ToString();
+                if (_currentMember == "Stamp")
+                {
+                    _currentMember = null;
+                    _skipDepth = _depth;
+                }
+                else if (!IsKnownMember(_currentMember))
+                {
+                    _currentMember = null;
+                    BeginUnknownElement(name);
+                }
+            }
+
+            public void OnAttribute(ReadOnlySpan<char> name, ReadOnlySpan<char> value, int nameLine, int nameColumn, int valueLine, int valueColumn)
+            {
+                if (_unknownStack is not null)
+                {
+                    _unknownStack[^1].SetAttribute(name.ToString(), value.ToString());
+                    return;
+                }
+
+                if (_current is not null
+                    && _depth == _connectionDepth
+                    && name.SequenceEqual("id".AsSpan()))
+                {
+                    _current.Id = int.Parse(value, System.Globalization.CultureInfo.InvariantCulture);
+                }
+            }
+
+            public void OnText(ReadOnlySpan<char> text, int line, int column)
+            {
+                if (_unknownStack is not null)
+                {
+                    _unknownStack[^1].AppendChild(_unknownDocument!.CreateTextNode(text.ToString()));
+                    return;
+                }
+
+                if (_current is not null
+                    && _currentMember is not null
+                    && _depth == _connectionDepth + 1)
+                {
+                    SetCurrentMember(text);
+                }
+            }
+
+            public void OnCData(ReadOnlySpan<char> cdata, int line, int column)
+            {
+                if (_unknownStack is not null)
+                {
+                    _unknownStack[^1].AppendChild(_unknownDocument!.CreateCDataSection(cdata.ToString()));
+                }
+            }
+
+            public void OnComment(ReadOnlySpan<char> comment, int line, int column)
+            {
+                if (_unknownStack is not null)
+                {
+                    _unknownStack[^1].AppendChild(_unknownDocument!.CreateComment(comment.ToString()));
+                }
+            }
+
+            public void OnEndTag(ReadOnlySpan<char> name, int line, int column) => EndElement();
+
+            public void OnEndTagEmpty() => EndElement();
+
+            public ConnectionBenchModel GetResult() => _result ?? throw new XmlException("No Connection element was found.");
+
+            public ConnectionBenchModel[] GetArrayResult() => _results?.ToArray() ?? [];
+
+            private static bool IsKnownMember(string name)
+            {
+                return name is "Name" or "Host" or "Description" or "Folder" or "Username" or "Domain"
+                    or "Port" or "Enabled" or "Protocol" or "Timeout" or "RetryCount" or "UseGateway"
+                    or "GatewayHost" or "GatewayPort" or "Color" or "Tags" or "CreatedBy" or "UpdatedBy"
+                    or "Image";
+            }
+
+            private void SetCurrentMember(ReadOnlySpan<char> value)
+            {
+                switch (_currentMember)
+                {
+                    case "Name": _current!.Name = value.ToString(); break;
+                    case "Host": _current!.Host = value.ToString(); break;
+                    case "Description": _current!.Description = value.ToString(); break;
+                    case "Folder": _current!.Folder = value.ToString(); break;
+                    case "Username": _current!.Username = value.ToString(); break;
+                    case "Domain": _current!.Domain = value.ToString(); break;
+                    case "Port": _current!.Port = int.Parse(value, System.Globalization.CultureInfo.InvariantCulture); break;
+                    case "Enabled": _current!.Enabled = XmlConvert.ToBoolean(value.ToString()); break;
+                    case "Protocol": _current!.Protocol = value.SequenceEqual("Rdp".AsSpan()) ? ConnectionProtocol.Rdp : ConnectionProtocol.Ssh; break;
+                    case "Timeout": _current!.Timeout = int.Parse(value, System.Globalization.CultureInfo.InvariantCulture); break;
+                    case "RetryCount": _current!.RetryCount = int.Parse(value, System.Globalization.CultureInfo.InvariantCulture); break;
+                    case "UseGateway": _current!.UseGateway = XmlConvert.ToBoolean(value.ToString()); break;
+                    case "GatewayHost": _current!.GatewayHost = value.ToString(); break;
+                    case "GatewayPort": _current!.GatewayPort = int.Parse(value, System.Globalization.CultureInfo.InvariantCulture); break;
+                    case "Color": _current!.Color = value.ToString(); break;
+                    case "Tags": _current!.Tags = value.ToString(); break;
+                    case "CreatedBy": _current!.CreatedBy = value.ToString(); break;
+                    case "UpdatedBy": _current!.UpdatedBy = value.ToString(); break;
+                    case "Image": _current!.Image = Convert.FromBase64String(value.ToString()); break;
+                }
+            }
+
+            private void BeginUnknownElement(ReadOnlySpan<char> name)
+            {
+                _unknownDocument = new XmlDocument();
+                var element = _unknownDocument.CreateElement(name.ToString());
+                _unknownDocument.AppendChild(element);
+                _unknownStack = [element];
+            }
+
+            private void AddUnknownElement(ReadOnlySpan<char> name)
+            {
+                var element = _unknownDocument!.CreateElement(name.ToString());
+                _unknownStack![^1].AppendChild(element);
+                _unknownStack.Add(element);
+            }
+
+            private void EndElement()
+            {
+                if (_unknownStack is not null)
+                {
+                    var element = _unknownStack[^1];
+                    _unknownStack.RemoveAt(_unknownStack.Count - 1);
+                    if (_unknownStack.Count == 0)
+                    {
+                        (_unknownElements ??= []).Add(element);
+                        _unknownStack = null;
+                        _unknownDocument = null;
+                    }
+
+                    _depth--;
+                    return;
+                }
+
+                if (_skipDepth != 0)
+                {
+                    if (_depth == _skipDepth)
+                    {
+                        _skipDepth = 0;
+                    }
+
+                    _depth--;
+                    return;
+                }
+
+                if (_current is not null && _depth == _connectionDepth + 1)
+                {
+                    _currentMember = null;
+                }
+
+                if (_current is not null && _depth == _connectionDepth)
+                {
+                    if (_unknownElements is { Count: > 0 })
+                    {
+                        _current.UnknownProperties = _unknownElements.ToArray();
+                    }
+
+                    if (_isArray)
+                    {
+                        (_results ??= []).Add(_current);
+                    }
+                    else
+                    {
+                        _result = _current;
+                    }
+
+                    _current = null;
+                    _unknownElements = null;
+                }
+
+                _depth--;
+            }
+        }
 
     public static ConnectionBenchModel[] LoadArray(XmlReader reader, string itemElementName)
     {
