@@ -1,3 +1,4 @@
+using Devolutions.Roslyn.Attributes;
 using System.Xml;
 using System.Xml.Serialization;
 using TurboXml.Serialization;
@@ -221,11 +222,14 @@ public sealed class TurboXmlSerializerTests
         const string xml = """
                            <FieldBackedConnection>
                              <remote-desktop><Host>rdp.example.com</Host><Port>3389</Port></remote-desktop>
-                             <Credential><User>administrator</User></Credential>
-                             <Add-ons>
-                               <Add-on><Name>Gateway</Name></Add-on>
-                               <Add-on><Name>Clipboard</Name></Add-on>
-                             </Add-ons>
+                             <Credentials><User>administrator</User></Credentials>
+                             <AddOns>
+                               <FieldBackedAddOnFixture><Name>Gateway</Name></FieldBackedAddOnFixture>
+                               <FieldBackedAddOnFixture><Name>Clipboard</Name></FieldBackedAddOnFixture>
+                             </AddOns>
+                             <Aws>aws-value</Aws>
+                             <DvlsPamDashboard>dashboard-value</DvlsPamDashboard>
+                             <Override>reserved-value</Override>
                            </FieldBackedConnection>
                            """;
 
@@ -239,6 +243,9 @@ public sealed class TurboXmlSerializerTests
         Assert.AreEqual("administrator", credentials.User);
         Assert.HasCount(2, addOns);
         Assert.AreEqual("Clipboard", addOns[1].Name);
+        Assert.AreEqual("aws-value", result.Aws);
+        Assert.AreEqual("dashboard-value", result.DvlsPamDashboard);
+        Assert.AreEqual("reserved-value", result.Override);
     }
 
     private static T DeserializeWithXmlSerializer<T>(string xml)
@@ -385,33 +392,35 @@ public sealed class ConnectionEndpointFixture
 }
 
 [TurboXmlSerializable(typeof(FieldBackedConnectionFixture))]
-[TurboXmlFieldBackedProperty("TurboXml.Tests.GenerateLazyPropertyAttribute", PropertyNameArgument = "PropertyName")]
+[TurboXmlFieldBackedProperty(
+    "Devolutions.Roslyn.Attributes.GenerateLazyPropertyAttribute",
+    PropertyNameArgument = "PropertyName",
+    AdditionalAttributesArgument = "AdditionalAttributes")]
 internal sealed partial class FieldBackedConnectionFixtureContext : TurboXmlSerializerContext
 {
     public static FieldBackedConnectionFixtureContext Default { get; } = new();
 }
 
-[AttributeUsage(AttributeTargets.Field)]
-public sealed class GenerateLazyPropertyAttribute : Attribute
-{
-    public string? PropertyName { get; set; }
-}
-
 [XmlRoot("FieldBackedConnection")]
 public sealed class FieldBackedConnectionFixture
 {
-    [GenerateLazyProperty(PropertyName = "RDP")]
-    [XmlElement("remote-desktop")]
+    [GenerateLazyProperty(PropertyName = "RDP", AdditionalAttributes = new[] { "XmlElement(\"remote-desktop\")" })]
     private RdpConnectionFixture? rdp;
 
     [GenerateLazyProperty]
-    [XmlElement("Credential")]
     private FieldBackedCredentialFixture? credentials;
 
-    [GenerateLazyProperty(PropertyName = "AddOns")]
-    [XmlArray("Add-ons")]
-    [XmlArrayItem("Add-on")]
+    [GenerateLazyProperty]
     private List<FieldBackedAddOnFixture>? addOns;
+
+    [GenerateLazyProperty]
+    private string? aws;
+
+    [GenerateLazyProperty]
+    private string? dvlsPamDashboard;
+
+    [GenerateLazyProperty]
+    private string? @override;
 
     [XmlIgnore]
     public RdpConnectionFixture? RDP
@@ -432,6 +441,27 @@ public sealed class FieldBackedConnectionFixture
     {
         get => addOns;
         set => addOns = value;
+    }
+
+    [XmlIgnore]
+    public string? Aws
+    {
+        get => aws;
+        set => aws = value;
+    }
+
+    [XmlIgnore]
+    public string? DvlsPamDashboard
+    {
+        get => dvlsPamDashboard;
+        set => dvlsPamDashboard = value;
+    }
+
+    [XmlIgnore]
+    public string? Override
+    {
+        get => @override;
+        set => @override = value;
     }
 }
 

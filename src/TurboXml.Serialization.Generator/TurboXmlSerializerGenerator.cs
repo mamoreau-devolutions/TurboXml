@@ -238,25 +238,39 @@ public sealed class TurboXmlSerializerGenerator : IIncrementalGenerator
             }
 
             string? propertyNameArgument = null;
+            string? additionalAttributesArgument = null;
             foreach (var namedArgument in attribute.NamedArguments)
             {
-                if (namedArgument.Key != "PropertyNameArgument")
+                if (namedArgument.Key == "PropertyNameArgument")
                 {
-                    continue;
-                }
+                    if (namedArgument.Value.Value is not string configuredPropertyNameArgument
+                        || string.IsNullOrWhiteSpace(configuredPropertyNameArgument))
+                    {
+                        context.ReportDiagnostic(Diagnostic.Create(
+                            InvalidFieldBackedPropertyConfiguration,
+                            candidate.Symbol.Locations.FirstOrDefault(),
+                            candidate.Symbol.Name,
+                            "the property-name argument convention must be a non-empty string"));
+                        return null;
+                    }
 
-                if (namedArgument.Value.Value is not string configuredPropertyNameArgument
-                    || string.IsNullOrWhiteSpace(configuredPropertyNameArgument))
+                    propertyNameArgument = configuredPropertyNameArgument;
+                }
+                else if (namedArgument.Key == "AdditionalAttributesArgument")
                 {
-                    context.ReportDiagnostic(Diagnostic.Create(
-                        InvalidFieldBackedPropertyConfiguration,
-                        candidate.Symbol.Locations.FirstOrDefault(),
-                        candidate.Symbol.Name,
-                        "the property-name argument convention must be a non-empty string"));
-                    return null;
-                }
+                    if (namedArgument.Value.Value is not string configuredAdditionalAttributesArgument
+                        || string.IsNullOrWhiteSpace(configuredAdditionalAttributesArgument))
+                    {
+                        context.ReportDiagnostic(Diagnostic.Create(
+                            InvalidFieldBackedPropertyConfiguration,
+                            candidate.Symbol.Locations.FirstOrDefault(),
+                            candidate.Symbol.Name,
+                            "the additional-attributes argument convention must be a non-empty string"));
+                        return null;
+                    }
 
-                propertyNameArgument = configuredPropertyNameArgument;
+                    additionalAttributesArgument = configuredAdditionalAttributesArgument;
+                }
             }
 
             if (configurations.ContainsKey(markerAttributeMetadataName))
@@ -271,7 +285,7 @@ public sealed class TurboXmlSerializerGenerator : IIncrementalGenerator
 
             configurations.Add(
                 markerAttributeMetadataName,
-                new FieldBackedPropertyConfiguration(propertyNameArgument));
+                new FieldBackedPropertyConfiguration(propertyNameArgument, additionalAttributesArgument));
         }
 
         return configurations;
@@ -317,7 +331,8 @@ public sealed class TurboXmlSerializerGenerator : IIncrementalGenerator
             var xmlElement = GetAttribute(member.AttributeSource, "System.Xml.Serialization.XmlElementAttribute");
             var xmlArray = GetAttribute(member.AttributeSource, "System.Xml.Serialization.XmlArrayAttribute");
             var xmlArrayItem = GetAttribute(member.AttributeSource, "System.Xml.Serialization.XmlArrayItemAttribute");
-            if (xmlAttribute is not null && (xmlElement is not null || xmlArray is not null))
+            var hasXmlElement = xmlElement is not null || member.XmlElementNameOverride is not null;
+            if (xmlAttribute is not null && (hasXmlElement || xmlArray is not null))
             {
                 ReportUnsupportedMember(context, member, model, "a property cannot combine XmlAttribute with an XML element or array attribute");
                 continue;
@@ -332,7 +347,7 @@ public sealed class TurboXmlSerializerGenerator : IIncrementalGenerator
                     continue;
                 }
 
-                if (xmlArray is not null && xmlElement is not null)
+                if (xmlArray is not null && hasXmlElement)
                 {
                     ReportUnsupportedMember(context, member, model, "a collection cannot combine XmlArray with XmlElement");
                     continue;
@@ -346,10 +361,10 @@ public sealed class TurboXmlSerializerGenerator : IIncrementalGenerator
                     continue;
                 }
 
-                var collectionStyle = xmlElement is null ? CollectionStyle.Wrapped : CollectionStyle.Flat;
+                var collectionStyle = hasXmlElement ? CollectionStyle.Flat : CollectionStyle.Wrapped;
                 var elementName = collectionStyle == CollectionStyle.Wrapped
                     ? xmlArray is null ? member.PropertyName : GetXmlName(xmlArray, member.PropertyName)
-                    : GetXmlName(xmlElement!, member.PropertyName);
+                    : GetXmlElementName(xmlElement, member.PropertyName, member.XmlElementNameOverride);
                 var itemElementName = collectionStyle == CollectionStyle.Wrapped
                     ? xmlArrayItem is null ? GetDefaultElementName(collection.ElementType) : GetXmlName(xmlArrayItem, GetDefaultElementName(collection.ElementType))
                     : elementName;
@@ -379,9 +394,7 @@ public sealed class TurboXmlSerializerGenerator : IIncrementalGenerator
                 var attributeName = xmlAttribute is null ? null : GetXmlName(xmlAttribute, member.PropertyName);
                 var elementName = xmlAttribute is not null
                     ? null
-                    : xmlElement is null
-                        ? member.PropertyName
-                        : GetXmlName(xmlElement, member.PropertyName);
+                    : GetXmlElementName(xmlElement, member.PropertyName, member.XmlElementNameOverride);
                 members.Add(new MemberInfo(
                     member.PropertyName,
                     attributeName,
@@ -411,7 +424,7 @@ public sealed class TurboXmlSerializerGenerator : IIncrementalGenerator
             members.Add(new MemberInfo(
                 member.PropertyName,
                 null,
-                xmlElement is null ? member.PropertyName : GetXmlName(xmlElement, member.PropertyName),
+                GetXmlElementName(xmlElement, member.PropertyName, member.XmlElementNameOverride),
                 MemberKind.Model,
                 ScalarKind.None,
                 member.Type,
@@ -1243,7 +1256,18 @@ public sealed class TurboXmlSerializerGenerator : IIncrementalGenerator
                     continue;
                 }
 
-                yield return new SerializableMember(field, field.Type, propertyName, true);
+                if (!TryGetFieldBackedXmlElementName(markerAttribute, configuration, out var xmlElementNameOverride, out error))
+                {
+                    context.ReportDiagnostic(Diagnostic.Create(
+                        UnusableFieldBackedProperty,
+                        field.Locations.FirstOrDefault(),
+                        field.Name,
+                        model.Name,
+                        error));
+                    continue;
+                }
+
+                yield return new SerializableMember(field, field.Type, propertyName, true, xmlElementNameOverride);
             }
         }
     }
@@ -1276,21 +1300,80 @@ public sealed class TurboXmlSerializerGenerator : IIncrementalGenerator
             }
         }
 
-        var firstNameCharacter = 0;
-        while (firstNameCharacter < field.Name.Length && field.Name[firstNameCharacter] == '_')
-        {
-            firstNameCharacter++;
-        }
-
+        var firstNameCharacter = field.Name.StartsWith("@", StringComparison.Ordinal) ? 1 : 0;
         if (firstNameCharacter == field.Name.Length)
         {
             propertyName = string.Empty;
-            error = "the field name must contain a character other than underscores";
+            error = "the field name must contain a character";
             return false;
         }
 
         var derivedName = char.ToUpperInvariant(field.Name[firstNameCharacter]) + field.Name.Substring(firstNameCharacter + 1);
         return TryValidateGeneratedPropertyName(derivedName, out propertyName, out error);
+    }
+
+    private static bool TryGetFieldBackedXmlElementName(
+        AttributeData markerAttribute,
+        FieldBackedPropertyConfiguration configuration,
+        out string? xmlElementName,
+        out string error)
+    {
+        xmlElementName = null;
+        error = string.Empty;
+        if (configuration.AdditionalAttributesArgument is null)
+        {
+            return true;
+        }
+
+        foreach (var namedArgument in markerAttribute.NamedArguments)
+        {
+            if (namedArgument.Key != configuration.AdditionalAttributesArgument)
+            {
+                continue;
+            }
+
+            if (namedArgument.Value.Kind != TypedConstantKind.Array || namedArgument.Value.Values.IsDefault)
+            {
+                error = $"the '{configuration.AdditionalAttributesArgument}' marker argument must be a string collection";
+                return false;
+            }
+
+            foreach (var additionalAttribute in namedArgument.Value.Values)
+            {
+                if (additionalAttribute.Value is not string additionalAttributeText
+                    || !TryParseXmlElementOverride(additionalAttributeText, out var parsedXmlElementName))
+                {
+                    error = $"the '{configuration.AdditionalAttributesArgument}' marker argument supports only XmlElement(\"name\") declarations";
+                    return false;
+                }
+
+                if (xmlElementName is not null)
+                {
+                    error = $"the '{configuration.AdditionalAttributesArgument}' marker argument can specify XmlElement only once";
+                    return false;
+                }
+
+                xmlElementName = parsedXmlElementName;
+            }
+        }
+
+        return true;
+    }
+
+    private static bool TryParseXmlElementOverride(string text, out string xmlElementName)
+    {
+        const string prefix = "XmlElement(\"";
+        const string suffix = "\")";
+        if (!text.StartsWith(prefix, StringComparison.Ordinal)
+            || !text.EndsWith(suffix, StringComparison.Ordinal)
+            || text.Length <= prefix.Length + suffix.Length)
+        {
+            xmlElementName = string.Empty;
+            return false;
+        }
+
+        xmlElementName = text.Substring(prefix.Length, text.Length - prefix.Length - suffix.Length);
+        return xmlElementName.IndexOf('"') < 0 && xmlElementName.IndexOf('\\') < 0;
     }
 
     private static bool TryValidateGeneratedPropertyName(string name, out string propertyName, out string error)
@@ -1355,6 +1438,11 @@ public sealed class TurboXmlSerializerGenerator : IIncrementalGenerator
         }
 
         return fallback;
+    }
+
+    private static string GetXmlElementName(AttributeData? attribute, string fallback, string? xmlElementNameOverride)
+    {
+        return xmlElementNameOverride ?? (attribute is null ? fallback : GetXmlName(attribute, fallback));
     }
 
     private static string? GetExplicitXmlRootName(AttributeData? attribute) => GetExplicitXmlName(attribute, "ElementName");
@@ -1505,12 +1593,18 @@ public sealed class TurboXmlSerializerGenerator : IIncrementalGenerator
 
     private sealed class SerializableMember
     {
-        public SerializableMember(ISymbol attributeSource, ITypeSymbol type, string propertyName, bool isFieldBacked)
+        public SerializableMember(
+            ISymbol attributeSource,
+            ITypeSymbol type,
+            string propertyName,
+            bool isFieldBacked,
+            string? xmlElementNameOverride = null)
         {
             AttributeSource = attributeSource;
             Type = type;
             PropertyName = propertyName;
             IsFieldBacked = isFieldBacked;
+            XmlElementNameOverride = xmlElementNameOverride;
         }
 
         public ISymbol AttributeSource { get; }
@@ -1520,16 +1614,21 @@ public sealed class TurboXmlSerializerGenerator : IIncrementalGenerator
         public string PropertyName { get; }
 
         public bool IsFieldBacked { get; }
+
+        public string? XmlElementNameOverride { get; }
     }
 
     private sealed class FieldBackedPropertyConfiguration
     {
-        public FieldBackedPropertyConfiguration(string? propertyNameArgument)
+        public FieldBackedPropertyConfiguration(string? propertyNameArgument, string? additionalAttributesArgument)
         {
             PropertyNameArgument = propertyNameArgument;
+            AdditionalAttributesArgument = additionalAttributesArgument;
         }
 
         public string? PropertyNameArgument { get; }
+
+        public string? AdditionalAttributesArgument { get; }
     }
 
     private sealed class CollectionInfo

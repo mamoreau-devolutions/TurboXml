@@ -13,8 +13,8 @@ namespace TurboXml.Serialization;
 /// </para>
 /// <para>
 /// When <see cref="PropertyNameArgument"/> is configured and that named argument is present on the marker
-/// attribute, its value is used as the generated property's name. Otherwise, TurboXml removes leading
-/// underscores from the field name and uppercases its first remaining character.
+/// attribute, its value is used as the generated property's name. Otherwise, TurboXml removes an optional
+/// leading <c>@</c> from the field name and uppercases its first character.
 /// </para>
 /// </remarks>
 [AttributeUsage(AttributeTargets.Class, AllowMultiple = true, Inherited = false)]
@@ -44,4 +44,13 @@ public sealed class TurboXmlFieldBackedPropertyAttribute : Attribute
     /// the field naming convention described by this attribute is used.
     /// </remarks>
     public string? PropertyNameArgument { get; set; }
+
+    /// <summary>
+    /// Gets or sets the optional named argument on the marker attribute that supplies restricted XML member overrides.
+    /// </summary>
+    /// <remarks>
+    /// The named argument must be a collection of strings in the form <c>XmlElement("name")</c>. TurboXml
+    /// uses the configured XML element name without evaluating source text or using reflection.
+    /// </remarks>
+    public string? AdditionalAttributesArgument { get; set; }
 }

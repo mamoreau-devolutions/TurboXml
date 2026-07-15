@@ -102,13 +102,14 @@ When another source generator emits public properties from source-visible annota
 [TurboXmlSerializable(typeof(Connection))]
 [TurboXmlFieldBackedProperty(
     "MyCompany.CodeGeneration.GenerateLazyPropertyAttribute",
-    PropertyNameArgument = "PropertyName")]
+    PropertyNameArgument = "PropertyName",
+    AdditionalAttributesArgument = "AdditionalAttributes")]
 internal sealed partial class ConnectionContext : TurboXmlSerializerContext
 {
 }
 ```
 
-TurboXml discovers matching instance fields and uses their type and source-visible `System.Xml.Serialization` attributes while assigning the eventual public property. If the configured named argument is present on the marker, it names that property; otherwise, TurboXml removes leading underscores from the field name and uppercases its first remaining character (for example, `_credentials` becomes `Credentials`). The external generator must emit a compatible public setter. Invalid marker configuration and unusable fields report generator diagnostics rather than using reflection.
+TurboXml discovers all matching instance fields across the model hierarchy and uses their type and source-visible `System.Xml.Serialization` attributes while assigning the eventual public property. If the configured named argument is present on the marker, it names that property; otherwise, TurboXml removes an optional leading `@` and uppercases the first character (for example, `dvlsPamDashboard` becomes `DvlsPamDashboard`). `AdditionalAttributesArgument` optionally identifies a marker argument containing `XmlElement("name")` strings; TurboXml accepts that restricted override without evaluating source text. The external generator must emit a compatible public setter. Invalid marker configuration, overrides, and unusable fields report generator diagnostics rather than using reflection.
 
 ## 📊 Benchmarks
 
