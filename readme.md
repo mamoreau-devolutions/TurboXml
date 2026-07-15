@@ -96,6 +96,20 @@ The generated handler compares names as spans and assigns known values directly.
 
 The generated subset supports scalar element and attribute values, enums, nested model properties, root arrays, `XmlAnyElement`, and named unknown-element skips. It recursively emits `TurboXmlTypeInfo` for every reachable model while safely handling cycles. Model-owned collections may be `T[]`, `List<T>`, or a supported generic list interface (`IEnumerable<T>`, `ICollection<T>`, `IList<T>`, `IReadOnlyCollection<T>`, or `IReadOnlyList<T>`), with scalar, enum, or model items. Use `[XmlArray]` and `[XmlArrayItem]` for wrapped collections; `[XmlElement]` supports flat repeated collection items. Unsupported shapes report a source-generator diagnostic rather than falling back to reflection.
 
+When another source generator emits public properties from source-visible annotated fields, opt in with `TurboXmlFieldBackedPropertyAttribute` on the serializer context. Supply the external marker attribute's metadata name and, when applicable, the marker's named property-name argument:
+
+```c#
+[TurboXmlSerializable(typeof(Connection))]
+[TurboXmlFieldBackedProperty(
+    "MyCompany.CodeGeneration.GenerateLazyPropertyAttribute",
+    PropertyNameArgument = "PropertyName")]
+internal sealed partial class ConnectionContext : TurboXmlSerializerContext
+{
+}
+```
+
+TurboXml discovers matching instance fields and uses their type and source-visible `System.Xml.Serialization` attributes while assigning the eventual public property. If the configured named argument is present on the marker, it names that property; otherwise, TurboXml removes leading underscores from the field name and uppercases its first remaining character (for example, `_credentials` becomes `Credentials`). The external generator must emit a compatible public setter. Invalid marker configuration and unusable fields report generator diagnostics rather than using reflection.
+
 ## 📊 Benchmarks
 
 The solution contains 2 benchmarks:

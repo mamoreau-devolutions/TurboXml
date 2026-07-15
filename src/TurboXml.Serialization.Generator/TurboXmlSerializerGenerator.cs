@@ -28,6 +28,22 @@ public sealed class TurboXmlSerializerGenerator : IIncrementalGenerator
         DiagnosticSeverity.Error,
         true);
 
+    private static readonly DiagnosticDescriptor InvalidFieldBackedPropertyConfiguration = new(
+        "TXS003",
+        "Invalid TurboXml field-backed property configuration",
+        "Field-backed property configuration on serializer context '{0}' is invalid: {1}",
+        "TurboXml.Serialization",
+        DiagnosticSeverity.Error,
+        true);
+
+    private static readonly DiagnosticDescriptor UnusableFieldBackedProperty = new(
+        "TXS004",
+        "Unusable TurboXml field-backed property",
+        "Field '{0}' on '{1}' cannot be used as a field-backed generated property: {2}",
+        "TurboXml.Serialization",
+        DiagnosticSeverity.Error,
+        true);
+
     public void Initialize(IncrementalGeneratorInitializationContext context)
     {
         var contexts = context.SyntaxProvider.CreateSyntaxProvider(
@@ -64,7 +80,24 @@ public sealed class TurboXmlSerializerGenerator : IIncrementalGenerator
             return null;
         }
 
-        return new ContextCandidate(symbol, declaration.Modifiers.Any(SyntaxKind.PartialKeyword), serializableAttributes);
+        var fieldBackedPropertyAttributes = symbol.GetAttributes()
+            .Where(static attribute => attribute.AttributeClass?.ToDisplayString() == "TurboXml.Serialization.TurboXmlFieldBackedPropertyAttribute")
+            .ToImmutableArray();
+        var invalidFieldMarkerAttributeMetadataNames = fieldBackedPropertyAttributes
+            .Where(attribute => attribute.ConstructorArguments.Length != 1
+                || attribute.ConstructorArguments[0].Value is not string metadataName
+                || context.SemanticModel.Compilation.GetTypeByMetadataName(metadataName) is not INamedTypeSymbol markerAttribute
+                || !IsAttributeType(markerAttribute))
+            .Select(attribute => attribute.ConstructorArguments.Length == 1 && attribute.ConstructorArguments[0].Value is string metadataName
+                ? metadataName
+                : string.Empty)
+            .ToImmutableArray();
+        return new ContextCandidate(
+            symbol,
+            declaration.Modifiers.Any(SyntaxKind.PartialKeyword),
+            serializableAttributes,
+            fieldBackedPropertyAttributes,
+            invalidFieldMarkerAttributeMetadataNames);
     }
 
     private static void GenerateContext(SourceProductionContext context, ContextCandidate candidate)
@@ -76,6 +109,12 @@ public sealed class TurboXmlSerializerGenerator : IIncrementalGenerator
         }
 
         var skipElements = GetSkipElements(candidate.Symbol);
+        var fieldBackedPropertyConfigurations = GetFieldBackedPropertyConfigurations(context, candidate);
+        if (fieldBackedPropertyConfigurations is null)
+        {
+            return;
+        }
+
         var pendingModels = new Queue<INamedTypeSymbol>();
         var discoveredModels = new HashSet<INamedTypeSymbol>(SymbolEqualityComparer.Default);
         foreach (var attribute in candidate.SerializableAttributes)
@@ -92,7 +131,7 @@ public sealed class TurboXmlSerializerGenerator : IIncrementalGenerator
         while (pendingModels.Count > 0)
         {
             var model = pendingModels.Dequeue();
-            var modelInfo = CreateModelInfo(context, model, skipElements);
+            var modelInfo = CreateModelInfo(context, model, skipElements, fieldBackedPropertyConfigurations);
             if (modelInfo is null)
             {
                 return;
@@ -169,10 +208,80 @@ public sealed class TurboXmlSerializerGenerator : IIncrementalGenerator
         return result;
     }
 
+    private static Dictionary<string, FieldBackedPropertyConfiguration>? GetFieldBackedPropertyConfigurations(
+        SourceProductionContext context,
+        ContextCandidate candidate)
+    {
+        var configurations = new Dictionary<string, FieldBackedPropertyConfiguration>(StringComparer.Ordinal);
+        foreach (var attribute in candidate.FieldBackedPropertyAttributes)
+        {
+            if (attribute.ConstructorArguments.Length != 1
+                || attribute.ConstructorArguments[0].Value is not string markerAttributeMetadataName
+                || string.IsNullOrWhiteSpace(markerAttributeMetadataName))
+            {
+                context.ReportDiagnostic(Diagnostic.Create(
+                    InvalidFieldBackedPropertyConfiguration,
+                    candidate.Symbol.Locations.FirstOrDefault(),
+                    candidate.Symbol.Name,
+                    "the field marker attribute metadata name must be non-empty"));
+                return null;
+            }
+
+            if (candidate.InvalidFieldMarkerAttributeMetadataNames.Contains(markerAttributeMetadataName))
+            {
+                context.ReportDiagnostic(Diagnostic.Create(
+                    InvalidFieldBackedPropertyConfiguration,
+                    candidate.Symbol.Locations.FirstOrDefault(),
+                    candidate.Symbol.Name,
+                    $"the marker attribute '{markerAttributeMetadataName}' does not resolve to an attribute type"));
+                return null;
+            }
+
+            string? propertyNameArgument = null;
+            foreach (var namedArgument in attribute.NamedArguments)
+            {
+                if (namedArgument.Key != "PropertyNameArgument")
+                {
+                    continue;
+                }
+
+                if (namedArgument.Value.Value is not string configuredPropertyNameArgument
+                    || string.IsNullOrWhiteSpace(configuredPropertyNameArgument))
+                {
+                    context.ReportDiagnostic(Diagnostic.Create(
+                        InvalidFieldBackedPropertyConfiguration,
+                        candidate.Symbol.Locations.FirstOrDefault(),
+                        candidate.Symbol.Name,
+                        "the property-name argument convention must be a non-empty string"));
+                    return null;
+                }
+
+                propertyNameArgument = configuredPropertyNameArgument;
+            }
+
+            if (configurations.ContainsKey(markerAttributeMetadataName))
+            {
+                context.ReportDiagnostic(Diagnostic.Create(
+                    InvalidFieldBackedPropertyConfiguration,
+                    candidate.Symbol.Locations.FirstOrDefault(),
+                    candidate.Symbol.Name,
+                    $"the marker attribute '{markerAttributeMetadataName}' is configured more than once"));
+                return null;
+            }
+
+            configurations.Add(
+                markerAttributeMetadataName,
+                new FieldBackedPropertyConfiguration(propertyNameArgument));
+        }
+
+        return configurations;
+    }
+
     private static ModelInfo? CreateModelInfo(
         SourceProductionContext context,
         INamedTypeSymbol model,
-        Dictionary<INamedTypeSymbol, ImmutableArray<string>> skipElements)
+        Dictionary<INamedTypeSymbol, ImmutableArray<string>> skipElements,
+        Dictionary<string, FieldBackedPropertyConfiguration> fieldBackedPropertyConfigurations)
     {
         if (model.TypeKind != TypeKind.Class
             || model.IsAbstract
@@ -183,54 +292,49 @@ public sealed class TurboXmlSerializerGenerator : IIncrementalGenerator
         }
 
         var members = new List<MemberInfo>();
-        IPropertySymbol? unknownProperty = null;
-        foreach (var property in GetSerializableProperties(model))
+        string? unknownPropertyName = null;
+        foreach (var member in GetSerializableMembers(context, model, fieldBackedPropertyConfigurations))
         {
-            if (property.IsStatic || property.SetMethod is null || property.SetMethod.DeclaredAccessibility != Accessibility.Public)
+            if (HasAttribute(member.AttributeSource, "System.Xml.Serialization.XmlIgnoreAttribute"))
             {
                 continue;
             }
 
-            if (HasAttribute(property, "System.Xml.Serialization.XmlIgnoreAttribute"))
+            if (HasAttribute(member.AttributeSource, "System.Xml.Serialization.XmlAnyElementAttribute"))
             {
-                continue;
-            }
-
-            if (HasAttribute(property, "System.Xml.Serialization.XmlAnyElementAttribute"))
-            {
-                if (property.Type is IArrayTypeSymbol { ElementType: INamedTypeSymbol elementType }
+                if (member.Type is IArrayTypeSymbol { ElementType: INamedTypeSymbol elementType }
                     && elementType.ToDisplayString() == "System.Xml.XmlElement")
                 {
-                    unknownProperty = property;
+                    unknownPropertyName = member.PropertyName;
                     continue;
                 }
 
-                context.ReportDiagnostic(Diagnostic.Create(UnsupportedProperty, property.Locations.FirstOrDefault(), property.Name, model.Name, "XmlAnyElement must target XmlElement[]"));
+                ReportUnsupportedMember(context, member, model, "XmlAnyElement must target XmlElement[]");
                 continue;
             }
 
-            var xmlAttribute = GetAttribute(property, "System.Xml.Serialization.XmlAttributeAttribute");
-            var xmlElement = GetAttribute(property, "System.Xml.Serialization.XmlElementAttribute");
-            var xmlArray = GetAttribute(property, "System.Xml.Serialization.XmlArrayAttribute");
-            var xmlArrayItem = GetAttribute(property, "System.Xml.Serialization.XmlArrayItemAttribute");
+            var xmlAttribute = GetAttribute(member.AttributeSource, "System.Xml.Serialization.XmlAttributeAttribute");
+            var xmlElement = GetAttribute(member.AttributeSource, "System.Xml.Serialization.XmlElementAttribute");
+            var xmlArray = GetAttribute(member.AttributeSource, "System.Xml.Serialization.XmlArrayAttribute");
+            var xmlArrayItem = GetAttribute(member.AttributeSource, "System.Xml.Serialization.XmlArrayItemAttribute");
             if (xmlAttribute is not null && (xmlElement is not null || xmlArray is not null))
             {
-                context.ReportDiagnostic(Diagnostic.Create(UnsupportedProperty, property.Locations.FirstOrDefault(), property.Name, model.Name, "a property cannot combine XmlAttribute with an XML element or array attribute"));
+                ReportUnsupportedMember(context, member, model, "a property cannot combine XmlAttribute with an XML element or array attribute");
                 continue;
             }
 
-            var collection = GetCollectionInfo(property.Type);
+            var collection = GetCollectionInfo(member.Type);
             if (collection is not null)
             {
                 if (xmlAttribute is not null)
                 {
-                    context.ReportDiagnostic(Diagnostic.Create(UnsupportedProperty, property.Locations.FirstOrDefault(), property.Name, model.Name, "collections cannot be XML attributes"));
+                    ReportUnsupportedMember(context, member, model, "collections cannot be XML attributes");
                     continue;
                 }
 
                 if (xmlArray is not null && xmlElement is not null)
                 {
-                    context.ReportDiagnostic(Diagnostic.Create(UnsupportedProperty, property.Locations.FirstOrDefault(), property.Name, model.Name, "a collection cannot combine XmlArray with XmlElement"));
+                    ReportUnsupportedMember(context, member, model, "a collection cannot combine XmlArray with XmlElement");
                     continue;
                 }
 
@@ -238,20 +342,20 @@ public sealed class TurboXmlSerializerGenerator : IIncrementalGenerator
                 if (!TryGetScalarKind(collection.ElementType, out var collectionScalarKind)
                     && collectionModelType is null)
                 {
-                    context.ReportDiagnostic(Diagnostic.Create(UnsupportedProperty, property.Locations.FirstOrDefault(), property.Name, model.Name, "collection elements must be supported scalars, enums, or model classes"));
+                    ReportUnsupportedMember(context, member, model, "collection elements must be supported scalars, enums, or model classes");
                     continue;
                 }
 
                 var collectionStyle = xmlElement is null ? CollectionStyle.Wrapped : CollectionStyle.Flat;
                 var elementName = collectionStyle == CollectionStyle.Wrapped
-                    ? xmlArray is null ? property.Name : GetXmlName(xmlArray, property.Name)
-                    : GetXmlName(xmlElement!, property.Name);
+                    ? xmlArray is null ? member.PropertyName : GetXmlName(xmlArray, member.PropertyName)
+                    : GetXmlName(xmlElement!, member.PropertyName);
                 var itemElementName = collectionStyle == CollectionStyle.Wrapped
                     ? xmlArrayItem is null ? GetDefaultElementName(collection.ElementType) : GetXmlName(xmlArrayItem, GetDefaultElementName(collection.ElementType))
                     : elementName;
                 var kind = collectionScalarKind == ScalarKind.None ? MemberKind.ModelCollection : MemberKind.ScalarCollection;
                 members.Add(new MemberInfo(
-                    property,
+                    member.PropertyName,
                     null,
                     elementName,
                     kind,
@@ -266,25 +370,25 @@ public sealed class TurboXmlSerializerGenerator : IIncrementalGenerator
 
             if (xmlArray is not null || xmlArrayItem is not null)
             {
-                context.ReportDiagnostic(Diagnostic.Create(UnsupportedProperty, property.Locations.FirstOrDefault(), property.Name, model.Name, "XmlArray and XmlArrayItem require an array, List<T>, or a supported list interface"));
+                ReportUnsupportedMember(context, member, model, "XmlArray and XmlArrayItem require an array, List<T>, or a supported list interface");
                 continue;
             }
 
-            if (TryGetScalarKind(property.Type, out var scalarKind))
+            if (TryGetScalarKind(member.Type, out var scalarKind))
             {
-                var attributeName = xmlAttribute is null ? null : GetXmlName(xmlAttribute, property.Name);
+                var attributeName = xmlAttribute is null ? null : GetXmlName(xmlAttribute, member.PropertyName);
                 var elementName = xmlAttribute is not null
                     ? null
                     : xmlElement is null
-                        ? property.Name
-                        : GetXmlName(xmlElement, property.Name);
+                        ? member.PropertyName
+                        : GetXmlName(xmlElement, member.PropertyName);
                 members.Add(new MemberInfo(
-                    property,
+                    member.PropertyName,
                     attributeName,
                     elementName,
                     MemberKind.Scalar,
                     scalarKind,
-                    property.Type,
+                    member.Type,
                     null,
                     CollectionStyle.None,
                     null,
@@ -294,23 +398,23 @@ public sealed class TurboXmlSerializerGenerator : IIncrementalGenerator
 
             if (xmlAttribute is not null)
             {
-                context.ReportDiagnostic(Diagnostic.Create(UnsupportedProperty, property.Locations.FirstOrDefault(), property.Name, model.Name, "nested models cannot be XML attributes"));
+                ReportUnsupportedMember(context, member, model, "nested models cannot be XML attributes");
                 continue;
             }
 
-            if (property.Type is not INamedTypeSymbol nestedModelType)
+            if (member.Type is not INamedTypeSymbol nestedModelType)
             {
-                context.ReportDiagnostic(Diagnostic.Create(UnsupportedProperty, property.Locations.FirstOrDefault(), property.Name, model.Name, "nested model types must be named classes"));
+                ReportUnsupportedMember(context, member, model, "nested model types must be named classes");
                 continue;
             }
 
             members.Add(new MemberInfo(
-                property,
+                member.PropertyName,
                 null,
-                xmlElement is null ? property.Name : GetXmlName(xmlElement, property.Name),
+                xmlElement is null ? member.PropertyName : GetXmlName(xmlElement, member.PropertyName),
                 MemberKind.Model,
                 ScalarKind.None,
-                property.Type,
+                member.Type,
                 nestedModelType,
                 CollectionStyle.None,
                 null,
@@ -323,7 +427,7 @@ public sealed class TurboXmlSerializerGenerator : IIncrementalGenerator
             ?? GetXmlTypeName(typeAttribute)
             ?? model.Name;
         skipElements.TryGetValue(model, out var skips);
-        return new ModelInfo(model, rootName, members, unknownProperty, skips);
+        return new ModelInfo(model, rootName, members, unknownPropertyName, skips);
     }
 
     private static void AssignIdentifiers(List<ModelInfo> models)
@@ -753,7 +857,7 @@ public sealed class TurboXmlSerializerGenerator : IIncrementalGenerator
                 var member = model.Members[index];
                 if (member.Kind == MemberKind.Scalar)
                 {
-                    source.Append("                        case ").Append(index).Append(": { ((").Append(FullyQualified(model.Symbol)).Append(")frame.Model).").Append(member.Symbol.Name).Append(" = ").Append(GetParseExpression(member.ScalarKind, member.ValueType)).AppendLine("; return; }");
+                    source.Append("                        case ").Append(index).Append(": { ((").Append(FullyQualified(model.Symbol)).Append(")frame.Model).").Append(GetMemberAccessName(member.PropertyName)).Append(" = ").Append(GetParseExpression(member.ScalarKind, member.ValueType)).AppendLine("; return; }");
                 }
             }
 
@@ -840,7 +944,7 @@ public sealed class TurboXmlSerializerGenerator : IIncrementalGenerator
                 }
 
                 var list = "((global::System.Collections.Generic.List<" + FullyQualified(member.ValueType) + ">)frame.Collections[" + index + "]!)";
-                source.Append("                    if (frame.Collections[").Append(index).Append("] is not null) ((").Append(FullyQualified(model.Symbol)).Append(")frame.Model).").Append(member.Symbol.Name).Append(" = ").Append(member.CollectionAssignmentKind == CollectionAssignmentKind.Array ? list + ".ToArray()" : list).AppendLine(";");
+                source.Append("                    if (frame.Collections[").Append(index).Append("] is not null) ((").Append(FullyQualified(model.Symbol)).Append(")frame.Model).").Append(GetMemberAccessName(member.PropertyName)).Append(" = ").Append(member.CollectionAssignmentKind == CollectionAssignmentKind.Array ? list + ".ToArray()" : list).AppendLine(";");
             }
 
             source.AppendLine("                    return;");
@@ -871,7 +975,7 @@ public sealed class TurboXmlSerializerGenerator : IIncrementalGenerator
                 var member = model.Members[index];
                 if (member.Kind == MemberKind.Model)
                 {
-                    source.Append("                        case ").Append(index).Append(": ((").Append(FullyQualified(model.Symbol)).Append(")parent.Model).").Append(member.Symbol.Name).Append(" = (").Append(FullyQualified(member.ValueType)).AppendLine(")completed; return;");
+                    source.Append("                        case ").Append(index).Append(": ((").Append(FullyQualified(model.Symbol)).Append(")parent.Model).").Append(GetMemberAccessName(member.PropertyName)).Append(" = (").Append(FullyQualified(member.ValueType)).AppendLine(")completed; return;");
                 }
                 else if (member.Kind == MemberKind.ModelCollection)
                 {
@@ -895,7 +999,7 @@ public sealed class TurboXmlSerializerGenerator : IIncrementalGenerator
         source.AppendLine("        {");
         source.AppendLine("            switch (frame.ModelIndex)");
         source.AppendLine("            {");
-        foreach (var model in models.Where(static model => model.UnknownProperty is not null))
+        foreach (var model in models.Where(static model => model.UnknownPropertyName is not null))
         {
             source.Append("                case ").Append(model.Index).AppendLine(":");
             source.AppendLine("                {");
@@ -937,9 +1041,9 @@ public sealed class TurboXmlSerializerGenerator : IIncrementalGenerator
         source.AppendLine("            if (frame.UnknownElements is not { Count: > 0 }) return;");
         source.AppendLine("            switch (frame.ModelIndex)");
         source.AppendLine("            {");
-        foreach (var model in models.Where(static model => model.UnknownProperty is not null))
+        foreach (var model in models.Where(static model => model.UnknownPropertyName is not null))
         {
-            source.Append("                case ").Append(model.Index).Append(": ((").Append(FullyQualified(model.Symbol)).Append(")frame.Model).").Append(model.UnknownProperty!.Name).AppendLine(" = frame.UnknownElements.ToArray(); return;");
+            source.Append("                case ").Append(model.Index).Append(": ((").Append(FullyQualified(model.Symbol)).Append(")frame.Model).").Append(GetMemberAccessName(model.UnknownPropertyName!)).AppendLine(" = frame.UnknownElements.ToArray(); return;");
         }
 
         source.AppendLine("                default: return;");
@@ -1066,15 +1170,164 @@ public sealed class TurboXmlSerializerGenerator : IIncrementalGenerator
             : type;
     }
 
-    private static IEnumerable<IPropertySymbol> GetSerializableProperties(INamedTypeSymbol model)
+    private static IEnumerable<SerializableMember> GetSerializableMembers(
+        SourceProductionContext context,
+        INamedTypeSymbol model,
+        Dictionary<string, FieldBackedPropertyConfiguration> fieldBackedPropertyConfigurations)
     {
         for (var current = model; current is not null && current.SpecialType != SpecialType.System_Object; current = current.BaseType)
         {
             foreach (var property in current.GetMembers().OfType<IPropertySymbol>())
             {
-                yield return property;
+                if (!property.IsStatic
+                    && property.SetMethod is not null
+                    && property.SetMethod.DeclaredAccessibility == Accessibility.Public)
+                {
+                    yield return new SerializableMember(property, property.Type, property.Name, false);
+                }
+            }
+
+            if (fieldBackedPropertyConfigurations.Count == 0)
+            {
+                continue;
+            }
+
+            foreach (var field in current.GetMembers().OfType<IFieldSymbol>())
+            {
+                if (!field.Locations.Any(static location => location.IsInSource))
+                {
+                    continue;
+                }
+
+                var markerAttributes = field.GetAttributes()
+                    .Where(attribute => attribute.AttributeClass is not null
+                        && fieldBackedPropertyConfigurations.ContainsKey(attribute.AttributeClass.ToDisplayString()))
+                    .ToArray();
+                if (markerAttributes.Length == 0)
+                {
+                    continue;
+                }
+
+                if (field.IsStatic || field.IsConst)
+                {
+                    context.ReportDiagnostic(Diagnostic.Create(
+                        UnusableFieldBackedProperty,
+                        field.Locations.FirstOrDefault(),
+                        field.Name,
+                        model.Name,
+                        "the backing field must be an instance field"));
+                    continue;
+                }
+
+                if (markerAttributes.Length != 1)
+                {
+                    context.ReportDiagnostic(Diagnostic.Create(
+                        UnusableFieldBackedProperty,
+                        field.Locations.FirstOrDefault(),
+                        field.Name,
+                        model.Name,
+                        "the backing field has more than one configured marker attribute"));
+                    continue;
+                }
+
+                var markerAttribute = markerAttributes[0];
+                var configuration = fieldBackedPropertyConfigurations[markerAttribute.AttributeClass!.ToDisplayString()];
+                if (!TryGetFieldBackedPropertyName(field, markerAttribute, configuration, out var propertyName, out var error))
+                {
+                    context.ReportDiagnostic(Diagnostic.Create(
+                        UnusableFieldBackedProperty,
+                        field.Locations.FirstOrDefault(),
+                        field.Name,
+                        model.Name,
+                        error));
+                    continue;
+                }
+
+                yield return new SerializableMember(field, field.Type, propertyName, true);
             }
         }
+    }
+
+    private static bool TryGetFieldBackedPropertyName(
+        IFieldSymbol field,
+        AttributeData markerAttribute,
+        FieldBackedPropertyConfiguration configuration,
+        out string propertyName,
+        out string error)
+    {
+        if (configuration.PropertyNameArgument is not null)
+        {
+            foreach (var namedArgument in markerAttribute.NamedArguments)
+            {
+                if (namedArgument.Key != configuration.PropertyNameArgument)
+                {
+                    continue;
+                }
+
+                if (namedArgument.Value.Value is not string configuredName
+                    || string.IsNullOrWhiteSpace(configuredName))
+                {
+                    propertyName = string.Empty;
+                    error = $"the '{configuration.PropertyNameArgument}' marker argument must be a non-empty string";
+                    return false;
+                }
+
+                return TryValidateGeneratedPropertyName(configuredName, out propertyName, out error);
+            }
+        }
+
+        var firstNameCharacter = 0;
+        while (firstNameCharacter < field.Name.Length && field.Name[firstNameCharacter] == '_')
+        {
+            firstNameCharacter++;
+        }
+
+        if (firstNameCharacter == field.Name.Length)
+        {
+            propertyName = string.Empty;
+            error = "the field name must contain a character other than underscores";
+            return false;
+        }
+
+        var derivedName = char.ToUpperInvariant(field.Name[firstNameCharacter]) + field.Name.Substring(firstNameCharacter + 1);
+        return TryValidateGeneratedPropertyName(derivedName, out propertyName, out error);
+    }
+
+    private static bool TryValidateGeneratedPropertyName(string name, out string propertyName, out string error)
+    {
+        if (!SyntaxFacts.IsValidIdentifier(name))
+        {
+            propertyName = string.Empty;
+            error = $"'{name}' is not a valid generated property name";
+            return false;
+        }
+
+        propertyName = name;
+        error = string.Empty;
+        return true;
+    }
+
+    private static bool IsAttributeType(INamedTypeSymbol type)
+    {
+        for (var current = type; current is not null; current = current.BaseType)
+        {
+            if (current.ToDisplayString() == "System.Attribute")
+            {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    private static void ReportUnsupportedMember(SourceProductionContext context, SerializableMember member, INamedTypeSymbol model, string reason)
+    {
+        context.ReportDiagnostic(Diagnostic.Create(
+            member.IsFieldBacked ? UnusableFieldBackedProperty : UnsupportedProperty,
+            member.AttributeSource.Locations.FirstOrDefault(),
+            member.AttributeSource.Name,
+            model.Name,
+            reason));
     }
 
     private static bool HasAttribute(ISymbol symbol, string name) => GetAttribute(symbol, name) is not null;
@@ -1137,15 +1390,30 @@ public sealed class TurboXmlSerializerGenerator : IIncrementalGenerator
 
     private static string FullyQualified(ITypeSymbol symbol) => symbol.ToDisplayString(SymbolDisplayFormat.FullyQualifiedFormat);
 
+    private static string GetMemberAccessName(string name)
+    {
+        return SyntaxFacts.GetKeywordKind(name) != SyntaxKind.None
+            || SyntaxFacts.GetContextualKeywordKind(name) != SyntaxKind.None
+            ? "@" + name
+            : name;
+    }
+
     private static string Literal(string value) => SymbolDisplay.FormatLiteral(value, true);
 
     private sealed class ContextCandidate
     {
-        public ContextCandidate(INamedTypeSymbol symbol, bool isPartial, ImmutableArray<AttributeData> serializableAttributes)
+        public ContextCandidate(
+            INamedTypeSymbol symbol,
+            bool isPartial,
+            ImmutableArray<AttributeData> serializableAttributes,
+            ImmutableArray<AttributeData> fieldBackedPropertyAttributes,
+            ImmutableArray<string> invalidFieldMarkerAttributeMetadataNames)
         {
             Symbol = symbol;
             IsPartial = isPartial;
             SerializableAttributes = serializableAttributes;
+            FieldBackedPropertyAttributes = fieldBackedPropertyAttributes;
+            InvalidFieldMarkerAttributeMetadataNames = invalidFieldMarkerAttributeMetadataNames;
         }
 
         public INamedTypeSymbol Symbol { get; }
@@ -1153,16 +1421,20 @@ public sealed class TurboXmlSerializerGenerator : IIncrementalGenerator
         public bool IsPartial { get; }
 
         public ImmutableArray<AttributeData> SerializableAttributes { get; }
+
+        public ImmutableArray<AttributeData> FieldBackedPropertyAttributes { get; }
+
+        public ImmutableArray<string> InvalidFieldMarkerAttributeMetadataNames { get; }
     }
 
     private sealed class ModelInfo
     {
-        public ModelInfo(INamedTypeSymbol symbol, string rootName, List<MemberInfo> members, IPropertySymbol? unknownProperty, ImmutableArray<string> skipElements)
+        public ModelInfo(INamedTypeSymbol symbol, string rootName, List<MemberInfo> members, string? unknownPropertyName, ImmutableArray<string> skipElements)
         {
             Symbol = symbol;
             RootName = rootName;
             Members = members;
-            UnknownProperty = unknownProperty;
+            UnknownPropertyName = unknownPropertyName;
             SkipElements = skipElements.IsDefault ? ImmutableArray<string>.Empty : skipElements;
             Identifier = string.Empty;
         }
@@ -1173,7 +1445,7 @@ public sealed class TurboXmlSerializerGenerator : IIncrementalGenerator
 
         public List<MemberInfo> Members { get; }
 
-        public IPropertySymbol? UnknownProperty { get; }
+        public string? UnknownPropertyName { get; }
 
         public ImmutableArray<string> SkipElements { get; }
 
@@ -1185,7 +1457,7 @@ public sealed class TurboXmlSerializerGenerator : IIncrementalGenerator
     private sealed class MemberInfo
     {
         public MemberInfo(
-            IPropertySymbol symbol,
+            string propertyName,
             string? attributeName,
             string? elementName,
             MemberKind kind,
@@ -1196,7 +1468,7 @@ public sealed class TurboXmlSerializerGenerator : IIncrementalGenerator
             string? itemElementName,
             CollectionAssignmentKind collectionAssignmentKind)
         {
-            Symbol = symbol;
+            PropertyName = propertyName;
             AttributeName = attributeName;
             ElementName = elementName;
             Kind = kind;
@@ -1208,7 +1480,7 @@ public sealed class TurboXmlSerializerGenerator : IIncrementalGenerator
             CollectionAssignmentKind = collectionAssignmentKind;
         }
 
-        public IPropertySymbol Symbol { get; }
+        public string PropertyName { get; }
 
         public string? AttributeName { get; }
 
@@ -1229,6 +1501,35 @@ public sealed class TurboXmlSerializerGenerator : IIncrementalGenerator
         public CollectionAssignmentKind CollectionAssignmentKind { get; }
 
         public bool IsCollection => Kind == MemberKind.ScalarCollection || Kind == MemberKind.ModelCollection;
+    }
+
+    private sealed class SerializableMember
+    {
+        public SerializableMember(ISymbol attributeSource, ITypeSymbol type, string propertyName, bool isFieldBacked)
+        {
+            AttributeSource = attributeSource;
+            Type = type;
+            PropertyName = propertyName;
+            IsFieldBacked = isFieldBacked;
+        }
+
+        public ISymbol AttributeSource { get; }
+
+        public ITypeSymbol Type { get; }
+
+        public string PropertyName { get; }
+
+        public bool IsFieldBacked { get; }
+    }
+
+    private sealed class FieldBackedPropertyConfiguration
+    {
+        public FieldBackedPropertyConfiguration(string? propertyNameArgument)
+        {
+            PropertyNameArgument = propertyNameArgument;
+        }
+
+        public string? PropertyNameArgument { get; }
     }
 
     private sealed class CollectionInfo

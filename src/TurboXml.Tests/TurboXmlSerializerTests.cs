@@ -215,6 +215,32 @@ public sealed class TurboXmlSerializerTests
         Assert.AreEqual(xmlTypeAndRootFramework.Name, xmlTypeAndRootGenerated.Name);
     }
 
+    [TestMethod]
+    public void Deserialize_MapsConfiguredFieldBackedGeneratedProperties()
+    {
+        const string xml = """
+                           <FieldBackedConnection>
+                             <remote-desktop><Host>rdp.example.com</Host><Port>3389</Port></remote-desktop>
+                             <Credential><User>administrator</User></Credential>
+                             <Add-ons>
+                               <Add-on><Name>Gateway</Name></Add-on>
+                               <Add-on><Name>Clipboard</Name></Add-on>
+                             </Add-ons>
+                           </FieldBackedConnection>
+                           """;
+
+        var result = TurboXmlSerializer.Deserialize(xml, FieldBackedConnectionFixtureContext.Default.FieldBackedConnectionFixtureTypeInfo);
+
+        var rdp = result.RDP ?? throw new InvalidOperationException("RDP was not deserialized.");
+        var credentials = result.Credentials ?? throw new InvalidOperationException("Credentials were not deserialized.");
+        var addOns = result.AddOns ?? throw new InvalidOperationException("Add-ons were not deserialized.");
+        Assert.AreEqual("rdp.example.com", rdp.Host);
+        Assert.AreEqual(3389, rdp.Port);
+        Assert.AreEqual("administrator", credentials.User);
+        Assert.HasCount(2, addOns);
+        Assert.AreEqual("Clipboard", addOns[1].Name);
+    }
+
     private static T DeserializeWithXmlSerializer<T>(string xml)
     {
         var serializer = new XmlSerializer(typeof(T));
@@ -356,4 +382,72 @@ public sealed class ConnectionEndpointFixture
     public string Host { get; set; } = string.Empty;
 
     public int Port { get; set; }
+}
+
+[TurboXmlSerializable(typeof(FieldBackedConnectionFixture))]
+[TurboXmlFieldBackedProperty("TurboXml.Tests.GenerateLazyPropertyAttribute", PropertyNameArgument = "PropertyName")]
+internal sealed partial class FieldBackedConnectionFixtureContext : TurboXmlSerializerContext
+{
+    public static FieldBackedConnectionFixtureContext Default { get; } = new();
+}
+
+[AttributeUsage(AttributeTargets.Field)]
+public sealed class GenerateLazyPropertyAttribute : Attribute
+{
+    public string? PropertyName { get; set; }
+}
+
+[XmlRoot("FieldBackedConnection")]
+public sealed class FieldBackedConnectionFixture
+{
+    [GenerateLazyProperty(PropertyName = "RDP")]
+    [XmlElement("remote-desktop")]
+    private RdpConnectionFixture? rdp;
+
+    [GenerateLazyProperty]
+    [XmlElement("Credential")]
+    private FieldBackedCredentialFixture? credentials;
+
+    [GenerateLazyProperty(PropertyName = "AddOns")]
+    [XmlArray("Add-ons")]
+    [XmlArrayItem("Add-on")]
+    private List<FieldBackedAddOnFixture>? addOns;
+
+    [XmlIgnore]
+    public RdpConnectionFixture? RDP
+    {
+        get => rdp;
+        set => rdp = value;
+    }
+
+    [XmlIgnore]
+    public FieldBackedCredentialFixture? Credentials
+    {
+        get => credentials;
+        set => credentials = value;
+    }
+
+    [XmlIgnore]
+    public List<FieldBackedAddOnFixture>? AddOns
+    {
+        get => addOns;
+        set => addOns = value;
+    }
+}
+
+public sealed class RdpConnectionFixture
+{
+    public string Host { get; set; } = string.Empty;
+
+    public int Port { get; set; }
+}
+
+public sealed class FieldBackedCredentialFixture
+{
+    public string User { get; set; } = string.Empty;
+}
+
+public sealed class FieldBackedAddOnFixture
+{
+    public string Name { get; set; } = string.Empty;
 }
